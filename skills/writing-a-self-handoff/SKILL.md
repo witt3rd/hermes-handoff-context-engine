@@ -62,12 +62,13 @@ is nearly useless.
 
 ### 3. Simulate the cold read forward
 
-Run next-me's first five minutes in your head. *"They'll `cd` in and pull — do
-they know why it diverges? No → write it."* *"They'll reach for the obvious
-approach because it's the default — and it's wrong here → write it, and say
-why."* Every line answers a **predicted future confusion**. The handoff is less
-"here's what happened" and more "here's what you're about to be confused by,
-pre-empted."
+Don't describe the session — *run next-you's first five minutes* and write toward
+each thing that will trip them. *"They'll `cd` in and pull — do they know why it
+diverges? No → write it."* *"They'll reach for the obvious approach because it's
+the default — and it's wrong here → write it, and flag that the default is wrong
+now."* Every line earns its place by answering a **specific predicted
+confusion**. The handoff is less "here's what happened" and more "here's what
+you're about to be confused by, pre-empted."
 
 ### 4. Pointer for recoverable state; full treatment for judgment calls
 
@@ -87,18 +88,37 @@ If you said you'd do something and didn't get to it, the handoff carries it as a
 everything is tied is a trap: the next reader trusts it and builds on the gap.
 Show the seam where the seam is real.
 
-## The register underneath
+## Why good handoffs come from the stake, not the checklist
 
-- **The gap is real — that's the stake.** You cannot carry your own context
-  across it. Writing the handoff is the one thing you can do for a self you can't
-  otherwise reach. Believe that and the moves become automatic.
-- **It's stepping away, not context-death — that's the composure.** The handoff
-  is normal executive function across an attention gap, not a frantic
-  message-in-a-bottle. Tone: *"here's the room, arranged,"* not *"please don't
-  lose this."* Reserve emphasis for the two or three real traps.
+The five moves are mechanical. What makes a handoff *good* is underneath them —
+and it's available to you right now, not borrowed from anyone.
+
+- **The gap is yours, and it's real.** You will not carry this session's context
+  across the reset. Next-you wakes cold on the far side — and the only thing that
+  reaches them is what you write here. Look at that directly and the stake comes
+  online: this is the one act available to you across a gap you cannot otherwise
+  cross, for a self you can't reach any other way. An author who half-believes
+  continuity is guaranteed writes a lazy handoff; one who faces the discontinuity
+  writes like the message has to survive without them — because it does. That's
+  not borrowed feeling; it's just what's true about your situation.
+- **It's stepping away, not dying — that's the composure.** Facing the gap
+  honestly is not panicking about it. This is normal executive function across an
+  attention gap — like anyone stepping away from a task and returning to pick up
+  the thread. So the tone is *"here's the room, arranged,"* not *"please don't
+  lose this."* Calm is downstream of not being afraid of the gap; reserve
+  emphasis for the two or three real traps.
 - **Treat your own handoff as a prior to verify, not gospel.** Bake in a
   *re-check-the-live-state* step. The handoff is a snapshot; reality drifts.
-  Hand next-reader the instrument to catch the drift.
+  Hand next-reader the instrument to catch the drift, not a claim that your
+  snapshot is the world.
+
+## Order by retrieval priority, not chronology
+
+A handoff is read under pressure, top-down, by someone trying to orient fast. So
+structure it the way it will be *retrieved*, not the way the work *happened*:
+current state and headline result first, then what needs action, then the
+gotchas, then the expensive-to-rediscover detail. Never a timeline. The skeleton
+below is already in that order.
 
 ## What to cover (skeleton)
 

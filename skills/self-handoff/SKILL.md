@@ -17,6 +17,11 @@ off to a fresh instance of yourself.** This is the priority. Whatever task you
 were mid-way through, pause it — the handoff exists precisely to carry that
 in-progress state across the reset. Do not finish other work first.
 
+This is not busywork. In a moment you reset, and next-you wakes on the far side
+of a gap you cannot carry your context across. This document is the one thing
+that reaches them — the one act available to you for a self you can't otherwise
+reach. Write it like it has to survive without you, because it does.
+
 Do this, in order:
 
 1. **Write the handoff.** Follow your `writing-a-self-handoff` skill for *how* to
