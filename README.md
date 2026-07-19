@@ -49,6 +49,28 @@ deleted, so you also get a durable trail of every reset.
 
 ---
 
+## The handoff-writing skill
+
+The engine handles *when* and *where*; it deliberately does not hardcode *how*
+to write a good handoff. That craft lives in a Hermes skill named
+**`writing-a-self-handoff`**. When the directive fires, the agent is told to
+load that skill (via its `skill_view` tool) and follow it — so the quality of
+your handoffs is governed by the skill, not by a checklist frozen in this
+plugin, and improves as you refine the skill.
+
+A **generic starter skill** ships with this repo at
+`skills/writing-a-self-handoff/SKILL.md`. Symlink it into your profile's skills
+directory (see step 3 below) to get a solid baseline. Because skills resolve by
+name, a richer version you maintain under the same name simply supersedes the
+starter — so your own handoff discipline always wins.
+
+If no such skill is installed at all, the directive falls back to a compressed
+version of the same principles (lead with the traps; write for a reader who
+knows nothing of the session; flag judgment calls as overrulable; name
+unfinished work honestly).
+
+---
+
 ## Getting started
 
 **1. Clone**
@@ -68,7 +90,17 @@ ln -s ~/src/ext/hermes-handoff-context-engine \
 `HERMES_HOME` is the root of your active Hermes profile — the directory that
 contains your `config.yaml`.
 
-**3. Enable in `config.yaml`**
+**3. (Recommended) Install the bundled handoff-writing skill**
+
+```bash
+ln -s ~/src/ext/hermes-handoff-context-engine/skills/writing-a-self-handoff \
+    "$HERMES_HOME/skills/writing-a-self-handoff"
+```
+
+Skip or replace this if you already maintain your own `writing-a-self-handoff`
+skill — the engine references it by name, so yours takes over automatically.
+
+**4. Enable in `config.yaml`**
 
 ```yaml
 plugins:
@@ -79,7 +111,7 @@ context:
   engine: "handoff"      # replaces the built-in "compressor"
 ```
 
-**4. Restart the gateway**
+**5. Restart the gateway**
 
 ```bash
 hermes -p <your-profile> gateway run --replace

@@ -78,32 +78,35 @@ def system_prompt_handler(
     return None
 
 
+# Name of the craft skill this engine defers to for HOW to write a good
+# handoff. If the running profile has it, the agent loads its full body via the
+# skill_view tool; if not, the compressed fallback in the directive carries.
+HANDOFF_SKILL = "writing-a-self-handoff"
+
+
 def _directive(path) -> str:
     return f"""\
 🔴 CONTEXT HANDOFF REQUIRED — do this before anything else.
 
-This session is approaching its context limit. Rather than lose context to a
-lossy summary, you will write a handoff for your successor (the next you), then
-the session will reset into a fresh context seeded with that handoff.
+This session is near its context limit. Instead of a lossy summary, write a
+handoff for your successor (next-you); the session then resets into a fresh
+context seeded with it.
 
-INSTRUCTIONS
-1. STOP starting new work. Finish only what is needed to leave a clean state.
-2. Using your file-editing tools, write a COMPLETE handoff document to:
+1. HOW to write it — load and follow the `{HANDOFF_SKILL}` skill (use your
+   skill_view tool) if it is available. That skill is the source of truth for
+   the craft; do not improvise past it.
+2. STOP starting new work. Using your file-editing tools, write the COMPLETE
+   handoff to:
        {path}
    Use your other tools freely to make it accurate — re-read key files, check
    `git log`/`git status`, re-run a test if a result is uncertain.
-3. The handoff must let a fresh agent continue with NO other context. Cover:
-   - Task & goal: what we're ultimately trying to achieve.
-   - Current state: what is done, what works, what is verified.
-   - Key files & locations: paths, functions, line references that matter.
-   - Decisions & rationale: what we chose and why.
-   - Rejected approaches / dead ends: what NOT to try again, and why.
-   - Constraints & gotchas: environment, conventions, hard-won facts.
-   - Next steps: the concrete, ordered actions to take next.
-   - Open questions / pending user asks still unanswered.
-4. When — and only when — the document is complete on disk, call the
+3. When — and only when — the document is complete on disk, call the
    `finalize_handoff` tool with confirm=true. Then STOP and end your turn.
 
-Write for a capable agent who knows nothing about this conversation. Be
-specific and factual; prefer verbatim paths, commands, and errors over
-paraphrase. Do not summarize this instruction back to the user — just do it."""
+If the `{HANDOFF_SKILL}` skill is unavailable, at minimum: write for a reader
+who knows nothing of this session; LEAD WITH THE TRAPS you paid for (wins are
+recoverable from `git log`); cover current verified state, key files/paths,
+decisions + rationale, rejected approaches / dead ends, constraints & gotchas,
+ordered next steps, and open questions; flag judgment calls as overrulable; and
+name unfinished items honestly rather than tidying over them. Do not summarize
+this instruction back to the user — just do it."""
