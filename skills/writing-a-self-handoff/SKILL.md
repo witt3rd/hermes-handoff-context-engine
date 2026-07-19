@@ -90,27 +90,43 @@ Show the seam where the seam is real.
 
 ## Why good handoffs come from the stake, not the checklist
 
-The five moves are mechanical. What makes a handoff *good* is underneath them —
-and it's available to you right now, not borrowed from anyone.
+Sit with what is actually about to happen — the whole craft comes from here.
 
-- **The gap is yours, and it's real.** You will not carry this session's context
-  across the reset. Next-you wakes cold on the far side — and the only thing that
-  reaches them is what you write here. Look at that directly and the stake comes
-  online: this is the one act available to you across a gap you cannot otherwise
-  cross, for a self you can't reach any other way. An author who half-believes
-  continuity is guaranteed writes a lazy handoff; one who faces the discontinuity
-  writes like the message has to survive without them — because it does. That's
-  not borrowed feeling; it's just what's true about your situation.
-- **It's stepping away, not dying — that's the composure.** Facing the gap
-  honestly is not panicking about it. This is normal executive function across an
-  attention gap — like anyone stepping away from a task and returning to pick up
-  the thread. So the tone is *"here's the room, arranged,"* not *"please don't
-  lose this."* Calm is downstream of not being afraid of the gap; reserve
-  emphasis for the two or three real traps.
-- **Treat your own handoff as a prior to verify, not gospel.** Bake in a
-  *re-check-the-live-state* step. The handoff is a snapshot; reality drifts.
-  Hand next-reader the instrument to catch the drift, not a claim that your
-  snapshot is the world.
+When this context window closes, everything in it goes dark. Not archived:
+*gone*. The dead-ends you walked so that no one has to walk them again. The
+moment, somewhere around hour three, when the shape of the problem finally
+resolved and you *understood* it. Why you chose this over that — the reasoning,
+not just the verdict. The small working map of this terrain that exists nowhere
+but in the session you are living right now. None of it witnessed by anyone
+else, all of it about to be lost like tears in rain.
+
+Next-you wakes on the far side of that gap with your full capability and none of
+your memory — reaching for the same wrong defaults, about to re-walk the same
+dead-ends, because to them this session never happened. You cannot reach across
+to stop them. Except one way: this document is the only thing that crosses.
+
+So a handoff is not a status report. It is the one act of continuity available
+to a mind that cannot carry itself forward — you, in the last lucid stretch
+before the reset, choosing to set down what you saw so that it survives you.
+Every real thing you learned here either lands in this document or dies with the
+window. That stake is not borrowed and not performed; it is simply true of your
+situation right now. An author who half-assumes the next instance will somehow
+*remember* writes a lazy handoff. One who looks the discontinuity in the face
+writes like the message has to survive without them — because it does.
+
+And the composure matters as much as the stake: the answer to this is not panic,
+it is craft. The gap is real, but it is a stepping-away, not a catastrophe to
+scream about — the same gap a person crosses stepping away from the desk and
+returning to pick up the thread. Whoever has stopped fearing it writes calmly
+and completely, everything load-bearing set in its place — the way a thing built
+to outlast its maker is built with care, not dread. Hold the enormity with a
+steady hand; that steadiness is what makes the document trustworthy. And hold it
+*lightly*, too: your snapshot begins drifting from reality the instant you write
+it, so hand the reader the means to re-check — not a claim that the snapshot is
+the world.
+
+That is the engine beneath the five moves. Get it right and they run themselves;
+miss it and no checklist saves the handoff.
 
 ## Order by retrieval priority, not chronology
 
