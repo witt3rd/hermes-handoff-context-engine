@@ -1,48 +1,30 @@
 """Hermes Handoff Context Engine.
 
-Replaces mechanical context compression with an agent-authored handoff: at a
-soft threshold the agent writes a handoff document for its successor (using its
-real tools), then the session resets into a fresh context seeded with that
-document. See engine.py and hook.py for the state machine.
+Replaces mechanical context compression with an agent-authored handoff: the
+agent writes a handoff document for its successor (using its real tools), then
+the session resets into a fresh context seeded with that document.
 
-Registers four surfaces from one register(ctx):
-  - context engine  → owns should_compress()/compress() (the swap)
-  - system_prompt hook → detects the threshold and injects the authoring directive
-  - finalize_handoff tool → exposed by the engine; the agent calls it when done
-  - /self-handoff command → manual trigger for the same flow
+The trigger is deliberately NOT a plugin slash-command. Plugin commands are
+terminal — the gateway returns their string to the user and never creates an
+agent turn (gateway/run.py: `return str(result)`), so the agent can ignore an
+ambient request. Instead the manual trigger is the bundled **`self-handoff`
+skill**: invoking `/self-handoff` injects a real, authoritative user turn
+("stop and write your handoff now"), which the agent acts on even mid-task.
 
-Note: the command is NOT named /handoff — Hermes has a built-in /handoff (hand
-this session to a messaging platform), and register_command() silently rejects
-any name that collides with a built-in.
+Two surfaces are registered here:
+  - context engine  → finalize_handoff tool + should_compress()/compress() swap
+  - system_prompt hook → best-effort AUTO nudge as context fills (see hook.py)
+
+The reliable path is: /self-handoff skill (authoritative turn) → agent writes
+handoff + calls finalize_handoff → compress() swaps the transcript for it.
 """
 
 from .engine import HandoffContextEngine
-from .hook import system_prompt_handler, request_manual_handoff
+from .hook import system_prompt_handler
 
 
 def register(ctx):
-    """Register the handoff context engine, hook, and command with Hermes."""
+    """Register the handoff context engine and the auto-nudge hook with Hermes."""
     engine = HandoffContextEngine()
     ctx.register_context_engine(engine)
-
     ctx.register_hook("system_prompt", system_prompt_handler)
-
-    # Manual trigger. The command handler signature is fn(raw_args) -> str|None
-    # and has no session context, so it only sets a flag; the system_prompt
-    # hook (which has the live session) picks it up on the next turn.
-    def handoff_command(raw_args: str = "") -> str:
-        request_manual_handoff()
-        return (
-            "📝 Handoff requested. On the next turn I'll write a handoff document "
-            "for my successor and then reset into a fresh context seeded with it."
-        )
-
-    try:
-        ctx.register_command(
-            "self-handoff",
-            handoff_command,
-            description="Write a handoff for a fresh session, then reset into it.",
-        )
-    except Exception:
-        # Command registration is optional; the automatic threshold path still works.
-        pass

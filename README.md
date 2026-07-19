@@ -18,34 +18,41 @@ context seeded with that document. No summary-of-a-summary. No telephone game.
 
 ## How it works
 
-The plugin registers four cooperating surfaces from a single `register(ctx)`:
+The trigger is what makes or breaks this. A plugin **slash command** is
+terminal — the gateway returns its string to the user and never creates an
+agent turn (`gateway/run.py`: `return str(result)`), so a busy agent simply
+ignores it. A **skill invocation**, by contrast, injects a real, authoritative
+user turn (*"[IMPORTANT: the user invoked this skill…]"*). So the manual trigger
+here is a **skill**, not a command.
+
+Three cooperating pieces:
 
 | Surface | Role |
 |---|---|
-| **`system_prompt` hook** (every turn) | Watches token usage. At a **soft** threshold, flips the session into *authoring* and injects a directive: "write your handoff to `<path>`, then call `finalize_handoff`." |
-| **`finalize_handoff` tool** | The agent calls it once the document is written. Marks the session *ready*. |
+| **`self-handoff` skill** (the trigger) | Invoking `/self-handoff` injects an authoritative user turn: *stop, write your handoff now (per the `writing-a-self-handoff` craft skill), then call `finalize_handoff`.* The agent acts on it even mid-task, because it's a real instruction — not ambient text. |
+| **`finalize_handoff` tool** (the engine) | The agent writes the handoff to a file it chooses, then calls this with the path. Marks the session *ready*. |
 | **`compress()`** (the engine) | On the next turn, discards the whole transcript and returns a fresh seed = system prompt + the authored handoff. **No LLM call** — the intelligence was produced by the real agent. |
-| **`/self-handoff` command** | Manual trigger for the same flow, any time you want a clean reset. (Named `/self-handoff`, not `/handoff` — the latter is a built-in Hermes command for handing a session to a messaging platform.) |
 
-The lifecycle is a three-phase state machine, stored per session in a small
-SQLite file so it survives the per-agent deep-copy Hermes performs on context
-engines:
+Plus a best-effort automatic path: a **`system_prompt` hook** watches *live*
+context usage and, past a soft threshold, nudges the agent toward a handoff.
+The nudge is weaker than the skill (a system-prompt line can be deferred), so
+it's a backstop, not the main path.
 
 ```
-normal ──(usage ≥ soft threshold, or /self-handoff)──▶ authoring
-authoring ──(agent writes doc, calls finalize_handoff)──▶ ready
-ready ──(should_compress→True, compress() swaps in the doc)──▶ normal
+/self-handoff skill ─▶ authoritative user turn ─▶ agent writes handoff + finalize_handoff(path)
+                                                        │
+                                          phase = ready ▼
+                          should_compress→True ─▶ compress() swaps transcript → fresh seed
 ```
 
-Because authoring happens at a **soft** threshold (default 60%), the agent still
-has room and full tool access to write an accurate handoff — it can re-read
-files, check `git`, and re-run tests while composing it. A **hard** threshold
-(default 80%) is a safety net: if no handoff was produced in time, `compress()`
-falls back to a plain head/tail truncation so the context window is never
-exceeded.
+If the agent never hands off and context reaches a **hard** threshold (default
+80%), `compress()` falls back to a plain head/tail truncation so the window is
+never exceeded and the session never dies. The soft-threshold nudge and the
+hard-threshold safety net both read a **live** token estimate of the
+conversation, not the lagging post-response usage.
 
-Handoff documents are written to `<profile>/handoffs/<session>.md` and are not
-deleted, so you also get a durable trail of every reset.
+Handoff documents are written wherever the agent chooses (it reports the path
+via `finalize_handoff`) and are not deleted, so you also get a durable trail.
 
 ---
 
@@ -90,15 +97,19 @@ ln -s ~/src/ext/hermes-handoff-context-engine \
 `HERMES_HOME` is the root of your active Hermes profile — the directory that
 contains your `config.yaml`.
 
-**3. (Recommended) Install the bundled handoff-writing skill**
+**3. Install the bundled skills** (the `self-handoff` trigger is **required**;
+the `writing-a-self-handoff` craft skill is recommended)
 
 ```bash
+# REQUIRED — the manual trigger. /self-handoff resolves to this skill.
+ln -s ~/src/ext/hermes-handoff-context-engine/skills/self-handoff \
+    "$HERMES_HOME/skills/self-handoff"
+
+# RECOMMENDED — how to write a good handoff. Skip if you maintain your own
+# writing-a-self-handoff skill; yours takes over automatically (resolved by name).
 ln -s ~/src/ext/hermes-handoff-context-engine/skills/writing-a-self-handoff \
     "$HERMES_HOME/skills/writing-a-self-handoff"
 ```
-
-Skip or replace this if you already maintain your own `writing-a-self-handoff`
-skill — the engine references it by name, so yours takes over automatically.
 
 **4. Enable in `config.yaml`**
 
@@ -109,6 +120,13 @@ plugins:
 
 context:
   engine: "handoff"      # replaces the built-in "compressor"
+
+# REQUIRED so the finalize_handoff tool is available to the agent: add
+# "context_engine" to the toolset list of every platform you drive this
+# profile from (cli / telegram / api_server / …).
+platform_toolsets:
+  cli:
+    - context_engine     # ...alongside your existing toolsets
 ```
 
 **5. Restart the gateway**
@@ -141,15 +159,16 @@ model and full toolset.
 
 ## Known limitations
 
-- **Manual `/self-handoff` and multi-session gateways.** The slash-command handler
-  receives no session context, so it sets a process-level flag that the next
-  turn to run the hook picks up. On a single active CLI session this is exact;
-  on a busy multi-session gateway it may trigger on whichever session ticks
-  first. The automatic threshold path is always per-session and unaffected.
-- **The agent must comply.** Authoring depends on the agent following the
-  injected directive. The prompt is forceful, but a determined agent can ignore
-  it — in which case the hard-threshold safety net truncates rather than hands
-  off.
+- **`finalize_handoff` requires the `context_engine` toolset.** Hermes only
+  registers a context engine's tools when `context_engine` is in the session's
+  enabled toolsets (`agent_init.py`). If it's missing, the agent writes the
+  handoff but can't finalize it — the swap never happens. See install step 4.
+- **The automatic (threshold) path is best-effort.** The `system_prompt` nudge
+  is weaker than the skill turn; a busy agent may defer it. It exists as a
+  backstop. For a guaranteed handoff, invoke the `/self-handoff` skill — that's
+  an authoritative user turn. If neither fires and context hits the hard
+  threshold, the safety-net truncation keeps the session alive (but that reset
+  is lossy — the whole point is to hand off *before* then).
 
 ---
 
