@@ -25,14 +25,14 @@ The plugin registers four cooperating surfaces from a single `register(ctx)`:
 | **`system_prompt` hook** (every turn) | Watches token usage. At a **soft** threshold, flips the session into *authoring* and injects a directive: "write your handoff to `<path>`, then call `finalize_handoff`." |
 | **`finalize_handoff` tool** | The agent calls it once the document is written. Marks the session *ready*. |
 | **`compress()`** (the engine) | On the next turn, discards the whole transcript and returns a fresh seed = system prompt + the authored handoff. **No LLM call** — the intelligence was produced by the real agent. |
-| **`/handoff` command** | Manual trigger for the same flow, any time you want a clean reset. |
+| **`/self-handoff` command** | Manual trigger for the same flow, any time you want a clean reset. (Named `/self-handoff`, not `/handoff` — the latter is a built-in Hermes command for handing a session to a messaging platform.) |
 
 The lifecycle is a three-phase state machine, stored per session in a small
 SQLite file so it survives the per-agent deep-copy Hermes performs on context
 engines:
 
 ```
-normal ──(usage ≥ soft threshold, or /handoff)──▶ authoring
+normal ──(usage ≥ soft threshold, or /self-handoff)──▶ authoring
 authoring ──(agent writes doc, calls finalize_handoff)──▶ ready
 ready ──(should_compress→True, compress() swaps in the doc)──▶ normal
 ```
@@ -141,7 +141,7 @@ model and full toolset.
 
 ## Known limitations
 
-- **Manual `/handoff` and multi-session gateways.** The slash-command handler
+- **Manual `/self-handoff` and multi-session gateways.** The slash-command handler
   receives no session context, so it sets a process-level flag that the next
   turn to run the hook picks up. On a single active CLI session this is exact;
   on a busy multi-session gateway it may trigger on whichever session ticks

@@ -9,7 +9,11 @@ Registers four surfaces from one register(ctx):
   - context engine  → owns should_compress()/compress() (the swap)
   - system_prompt hook → detects the threshold and injects the authoring directive
   - finalize_handoff tool → exposed by the engine; the agent calls it when done
-  - /handoff command → manual trigger for the same flow
+  - /self-handoff command → manual trigger for the same flow
+
+Note: the command is NOT named /handoff — Hermes has a built-in /handoff (hand
+this session to a messaging platform), and register_command() silently rejects
+any name that collides with a built-in.
 """
 
 from .engine import HandoffContextEngine
@@ -35,7 +39,7 @@ def register(ctx):
 
     try:
         ctx.register_command(
-            "handoff",
+            "self-handoff",
             handoff_command,
             description="Write a handoff for a fresh session, then reset into it.",
         )
