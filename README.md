@@ -120,14 +120,13 @@ plugins:
 
 context:
   engine: "handoff"      # replaces the built-in "compressor"
-
-# REQUIRED so the finalize_handoff tool is available to the agent: add
-# "context_engine" to the toolset list of every platform you drive this
-# profile from (cli / telegram / api_server / …).
-platform_toolsets:
-  cli:
-    - context_engine     # ...alongside your existing toolsets
 ```
+
+That's all the config needed. The `finalize_handoff` tool rides on Hermes'
+context-engine tool mechanism, which auto-enables whenever `context.engine` is
+set to a non-`compressor` engine (`tools_config.py`) — so you do **not** need to
+touch `platform_toolsets`. (The only exception is a platform whose toolset list
+you've explicitly set to empty `[]`, which opts out of everything.)
 
 **5. Restart the gateway**
 
@@ -159,10 +158,6 @@ model and full toolset.
 
 ## Known limitations
 
-- **`finalize_handoff` requires the `context_engine` toolset.** Hermes only
-  registers a context engine's tools when `context_engine` is in the session's
-  enabled toolsets (`agent_init.py`). If it's missing, the agent writes the
-  handoff but can't finalize it — the swap never happens. See install step 4.
 - **The automatic (threshold) path is best-effort.** The `system_prompt` nudge
   is weaker than the skill turn; a busy agent may defer it. It exists as a
   backstop. For a guaranteed handoff, invoke the `/self-handoff` skill — that's
