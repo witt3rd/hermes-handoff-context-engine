@@ -21,9 +21,7 @@ venv/
 ENV/
 env/
 
-# Handoff state DB and generated handoff documents (user data, not committed)
-handoff_state.db
-*.db
+# Generated handoff documents, if any land here during local testing
 handoffs/
 
 # IDE

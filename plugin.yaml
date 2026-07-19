@@ -3,6 +3,4 @@ description: "Instead of mechanically compressing, the agent writes its own hand
 version: "0.1.0"
 author: "Forge ⚒️ & Donald 🧙‍♂️"
 homepage: "https://github.com/witt3rd/hermes-handoff-context-engine"
-requirements:
-  - pyyaml
-  - sqlite3
+requirements: []   # pure standard library — no third-party dependencies

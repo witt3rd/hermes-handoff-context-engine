@@ -1,119 +1,70 @@
-"""SQLite-backed per-session handoff state.
+"""In-process per-session handoff state.
 
-The store holds ONLY a filesystem path — never a live connection — so the
-engine that owns it stays cheaply deep-copyable. Hermes deep-copies the
-context engine per child agent (agent_init.py), and every copy points at the
-same DB file, making this the single shared source of truth for a session's
-handoff phase across all engine copies and the ``system_prompt`` hook.
+The state is tiny — per session: a phase, the authored handoff's path, and a
+swap counter — and it only needs to live for the span of a handoff inside a
+running gateway. So it lives in a module-level dict guarded by a lock, not a
+database.
 
-Phases
-------
-``normal``    — business as usual; nothing to hand off yet.
-``authoring`` — the agent has been told to write its handoff and is doing so
-                (with full tool access); the directive is being injected every
-                turn until it finalizes.
-``ready``     — the agent called ``finalize_handoff``; the next ``compress()``
-                will swap the transcript for the authored document.
+Why a module global works despite Hermes deep-copying the engine per agent:
+the copies (and the system_prompt hook) all import THIS module, so they share
+this one ``_STATE`` dict. ``HandoffStore`` instances are stateless facades over
+it — deep-copying one copies nothing that matters.
+
+Deliberately NOT persistent: if the gateway restarts mid-handoff the state is
+lost, which is harmless — just re-trigger ``/self-handoff``. The handoff
+*documents* the agent writes are ordinary files and are unaffected.
 """
 
-import sqlite3
-from pathlib import Path
-from typing import Optional
+import threading
+from typing import Dict, Optional
 
 PHASE_NORMAL = "normal"
 PHASE_AUTHORING = "authoring"
 PHASE_READY = "ready"
 
+_LOCK = threading.Lock()
+_STATE: Dict[str, dict] = {}
+
+
+def _entry(session_id: str) -> dict:
+    e = _STATE.get(session_id)
+    if e is None:
+        e = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0}
+        _STATE[session_id] = e
+    return e
+
 
 class HandoffStore:
-    """Manages per-session handoff phase and the authored document's path."""
-
-    def __init__(self, db_path: Path):
-        self.db_path = Path(db_path)
-        self._init_db()
-
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS handoff_state (
-                    session_id   TEXT PRIMARY KEY,
-                    phase        TEXT DEFAULT 'normal',
-                    handoff_path TEXT,
-                    swap_count   INTEGER DEFAULT 0
-                );
-                """
-            )
-            conn.commit()
+    """Stateless facade over the shared, in-process handoff-state dict."""
 
     def ensure_session(self, session_id: str) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO handoff_state (session_id) VALUES (?);",
-                (session_id,),
-            )
-            conn.commit()
+        with _LOCK:
+            _entry(session_id)
 
     def get_phase(self, session_id: str) -> str:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT phase FROM handoff_state WHERE session_id = ?;",
-                (session_id,),
-            ).fetchone()
-            return row["phase"] if row and row["phase"] else PHASE_NORMAL
+        with _LOCK:
+            return _entry(session_id)["phase"]
 
     def set_phase(self, session_id: str, phase: str) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO handoff_state (session_id, phase) VALUES (?, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET phase = excluded.phase;",
-                (session_id, phase),
-            )
-            conn.commit()
+        with _LOCK:
+            _entry(session_id)["phase"] = phase
 
     def get_handoff_path(self, session_id: str) -> Optional[str]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT handoff_path FROM handoff_state WHERE session_id = ?;",
-                (session_id,),
-            ).fetchone()
-            return row["handoff_path"] if row else None
+        with _LOCK:
+            return _entry(session_id)["handoff_path"]
 
     def set_handoff_path(self, session_id: str, path: Optional[str]) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO handoff_state (session_id, handoff_path) VALUES (?, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET handoff_path = excluded.handoff_path;",
-                (session_id, path),
-            )
-            conn.commit()
+        with _LOCK:
+            _entry(session_id)["handoff_path"] = path
 
     def get_swap_count(self, session_id: str) -> int:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT swap_count FROM handoff_state WHERE session_id = ?;",
-                (session_id,),
-            ).fetchone()
-            return row["swap_count"] if row and row["swap_count"] else 0
+        with _LOCK:
+            return _entry(session_id)["swap_count"]
 
     def increment_swap_count(self, session_id: str) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE handoff_state SET swap_count = swap_count + 1 WHERE session_id = ?;",
-                (session_id,),
-            )
-            conn.commit()
+        with _LOCK:
+            _entry(session_id)["swap_count"] += 1
 
     def reset(self, session_id: str) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE handoff_state SET phase = 'normal', handoff_path = NULL, "
-                "swap_count = 0 WHERE session_id = ?;",
-                (session_id,),
-            )
-            conn.commit()
+        with _LOCK:
+            _STATE[session_id] = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0}

@@ -12,9 +12,7 @@ authors = [
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "pyyaml",
-]
+dependencies = []   # pure standard library
 
 [project.urls]
 Homepage = "https://github.com/witt3rd/hermes-handoff-context-engine"

@@ -82,15 +82,16 @@ class HandoffContextEngine(ContextEngine):
         home_arg = kwargs.get("hermes_home")
         self.hermes_home = Path(home_arg) if home_arg else Path.home() / ".hermes"
 
-        base_dir = self.hermes_home
-        if kwargs.get("profile"):
-            base_dir = self.hermes_home / "profiles" / kwargs["profile"]
-        base_dir.mkdir(parents=True, exist_ok=True)
+        # Default directory for the fallback handoff path. The agent normally
+        # chooses its own path (reported via finalize_handoff); this is only the
+        # default used when it doesn't.
+        self.handoff_dir = self.hermes_home / "handoffs"
+        try:
+            self.handoff_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
 
-        self.handoff_dir = base_dir / "handoffs"
-        self.handoff_dir.mkdir(parents=True, exist_ok=True)
-
-        self.store = HandoffStore(base_dir / "handoff_state.db")
+        self.store = HandoffStore()
         self.store.ensure_session(session_id)
         self.compression_count = self.store.get_swap_count(session_id)
 
