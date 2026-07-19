@@ -1,0 +1,8 @@
+name: "handoff"
+description: "Instead of mechanically compressing, the agent writes its own handoff document for its successor — then the session resets into a fresh context seeded with that handoff."
+version: "0.1.0"
+author: "Forge ⚒️ & Donald 🧙‍♂️"
+homepage: "https://github.com/witt3rd/hermes-handoff-context-engine"
+requirements:
+  - pyyaml
+  - sqlite3

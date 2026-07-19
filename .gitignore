@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-link
+.Python
+*.manifest
+*.spec
+
+# Virtual environments
+.env
+.venv
+venv/
+ENV/
+env/
+
+# Handoff state DB and generated handoff documents (user data, not committed)
+handoff_state.db
+*.db
+handoffs/
+
+# IDE
+.idea/
+.vscode/
+*.sw[po]
+*~
+
+# OS
+.DS_Store
+Thumbs.db

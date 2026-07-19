@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "hermes-handoff-context-engine"
+version = "0.1.0"
+description = "Agent-authored handoff instead of mechanical compression - a Hermes context engine plugin"
+authors = [
+    {name = "Forge & Donald", email = "forge@witt3rd.com"},
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml",
+]
+
+[project.urls]
+Homepage = "https://github.com/witt3rd/hermes-handoff-context-engine"
+Repository = "https://github.com/witt3rd/hermes-handoff-context-engine"
+Issues = "https://github.com/witt3rd/hermes-handoff-context-engine/issues"
