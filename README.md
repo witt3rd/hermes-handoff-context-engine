@@ -100,14 +100,19 @@ contains your `config.yaml`.
 **3. Install the bundled skills** (the `self-handoff` trigger is **required**;
 the `writing-a-self-handoff` craft skill is recommended)
 
+**Copy** these — don't symlink them. Unlike the plugin (code you track
+upstream), skills are starters meant to be *personalized*: your agent will
+refine its own handoff instructions over time, and a symlink would push those
+edits back into the repo (and lose them on `git pull`).
+
 ```bash
 # REQUIRED — the manual trigger. /self-handoff resolves to this skill.
-ln -s ~/src/ext/hermes-handoff-context-engine/skills/self-handoff \
+cp -r ~/src/ext/hermes-handoff-context-engine/skills/self-handoff \
     "$HERMES_HOME/skills/self-handoff"
 
 # RECOMMENDED — how to write a good handoff. Skip if you maintain your own
 # writing-a-self-handoff skill; yours takes over automatically (resolved by name).
-ln -s ~/src/ext/hermes-handoff-context-engine/skills/writing-a-self-handoff \
+cp -r ~/src/ext/hermes-handoff-context-engine/skills/writing-a-self-handoff \
     "$HERMES_HOME/skills/writing-a-self-handoff"
 ```
 
