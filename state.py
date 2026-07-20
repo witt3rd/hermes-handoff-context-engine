@@ -29,7 +29,7 @@ _STATE: Dict[str, dict] = {}
 def _entry(session_id: str) -> dict:
     e = _STATE.get(session_id)
     if e is None:
-        e = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0}
+        e = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0, "usage": 0.0}
         _STATE[session_id] = e
     return e
 
@@ -57,6 +57,20 @@ class HandoffStore:
         with _LOCK:
             _entry(session_id)["handoff_path"] = path
 
+    def get_usage(self, session_id: str) -> float:
+        """Context usage (0..1) recorded when authoring was triggered.
+
+        Written by the system_prompt hook (which can see the engine) and read by
+        the pre_llm_call hook (which cannot) to pick the urgency of the injected
+        instruction.
+        """
+        with _LOCK:
+            return _entry(session_id).get("usage", 0.0)
+
+    def set_usage(self, session_id: str, usage: float) -> None:
+        with _LOCK:
+            _entry(session_id)["usage"] = usage
+
     def get_swap_count(self, session_id: str) -> int:
         with _LOCK:
             return _entry(session_id)["swap_count"]
@@ -67,4 +81,7 @@ class HandoffStore:
 
     def reset(self, session_id: str) -> None:
         with _LOCK:
-            _STATE[session_id] = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0}
+            _STATE[session_id] = {
+                "phase": PHASE_NORMAL, "handoff_path": None,
+                "swap_count": 0, "usage": 0.0,
+            }

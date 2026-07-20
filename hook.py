@@ -1,18 +1,25 @@
-"""Per-turn AUTO nudge toward a handoff as context fills.
+"""Automatic handoff triggering, split across two hooks.
 
-The reliable, authoritative trigger is the bundled ``self-handoff`` skill — a
-real user turn the agent can't shrug off. This hook is only the best-effort
-AUTOMATIC path: as live context approaches the limit it nudges the agent to
-write a handoff and call ``finalize_handoff``. A system-prompt nudge is
-inherently weaker than the skill turn (a busy agent may defer it), which is
-exactly why the manual trigger is a skill and this is only a backstop. If the
-agent ignores the nudge and context reaches the hard limit, the engine's
-safety-net compaction (engine.compress) keeps the session from dying.
+Why two hooks. The reliable manual trigger is the ``self-handoff`` SKILL, because
+invoking a skill injects a real, authoritative *user turn* the agent acts on even
+mid-task. The automatic path originally tried to do the same job with a
+``system_prompt`` nudge — ambient text appended to the system prompt — and the
+live result was unambiguous: the nudge fired correctly at 55% and 58% of context
+and converted **zero** times out of two. A busy agent defers ambient text.
 
-Token accounting note: we estimate usage from the LIVE conversation
-(``estimate_messages_tokens_rough``) rather than the engine's
-``last_prompt_tokens``, which lags a turn behind and badly undercounts when a
-single turn adds large tool results.
+So detection and delivery are split:
+
+* ``system_prompt_handler`` — DETECTION. It receives ``agent``, so it can read the
+  engine's authoritative token count and decide when the soft threshold is
+  crossed. It flips the session to ``authoring`` and records usage. It injects
+  only a short marker line.
+* ``pre_llm_call_handler`` — DELIVERY. Hermes injects this hook's return value
+  into the **user message** rather than the system prompt, which is the strongest
+  channel available to a plugin. It does NOT receive ``agent``, so it reads the
+  phase (and urgency) from the shared in-process state the detection hook wrote.
+
+Ordering is safe: turn_context runs the system_prompt hook before the
+pre_llm_call hook, so detection and delivery happen in the same turn.
 """
 
 import logging
@@ -27,10 +34,15 @@ try:
 except Exception:  # pragma: no cover - defensive
     estimate_messages_tokens_rough = None
 
+# Above this fraction of the context window the situation is no longer "wrap up
+# at a natural pause" — a couple of big turns can hit the wall, so the injected
+# instruction escalates to stop-now.
+URGENT_USAGE = 0.68
+
 
 def _resolve_engine(agent: Any) -> Optional[Any]:
-    # The live per-agent engine is at .context_compressor (Hermes deep-copies
-    # the registered engine per agent). ._context_engine is NOT set by the host.
+    # The live per-agent engine is at .context_compressor (Hermes deep-copies the
+    # registered engine per agent). ._context_engine is NOT set by the host.
     engine = getattr(agent, "context_compressor", None) or getattr(agent, "_context_engine", None)
     if engine is None or getattr(engine, "name", None) != "handoff":
         return None
@@ -42,15 +54,12 @@ def _estimate_usage(engine: Any, conversation_history: List[Dict[str, Any]]) -> 
 
     Source of truth, in order:
 
-    1. ``last_preflight_tokens`` — the AUTHORITATIVE live request size the host
-       passed to ``should_compress()`` earlier this same turn (turn_context runs
-       the compression check before this hook). This is the number Hermes itself
-       decides on, so it is exact.
-    2. ``estimate_messages_tokens_rough`` — only if we haven't seen a preflight
-       number yet. It under-counts structured tool-result blocks badly, which is
-       why it is NOT the primary source: a session measured at 812k real tokens
-       estimated under 600k here, so the soft threshold never tripped and the
-       lossy truncation won instead of a handoff.
+    1. ``last_preflight_tokens`` — the live request size the host passed to
+       ``should_compress()``. This is the figure Hermes itself acts on.
+    2. ``estimate_messages_tokens_rough`` — only until we've seen a preflight
+       number (e.g. the first turn after a restart). It under-counts structured
+       tool-result blocks badly: a real 812k-token session estimated under 600k
+       here, which is exactly why it is not the primary source.
     3. ``last_prompt_tokens`` — last resort; lags a full turn behind.
     """
     ctx_len = getattr(engine, "context_length", 0) or 0
@@ -58,7 +67,6 @@ def _estimate_usage(engine: Any, conversation_history: List[Dict[str, Any]]) -> 
         return 0.0
 
     tokens = getattr(engine, "last_preflight_tokens", 0) or 0
-
     if not tokens and estimate_messages_tokens_rough and conversation_history:
         try:
             tokens = estimate_messages_tokens_rough(conversation_history)
@@ -69,6 +77,8 @@ def _estimate_usage(engine: Any, conversation_history: List[Dict[str, Any]]) -> 
 
     return tokens / ctx_len if ctx_len else 0.0
 
+
+# -- DETECTION -------------------------------------------------------------
 
 def system_prompt_handler(
     agent: Any,
@@ -86,37 +96,108 @@ def system_prompt_handler(
     store.ensure_session(session_id)
     phase = store.get_phase(session_id)
 
-    # Once a handoff is ready/authoring is in flight, don't add more nudges;
-    # the skill flow / compress swap take over.
     if phase != PHASE_NORMAL:
+        # Keep usage fresh so the injected instruction's urgency tracks reality
+        # as the session keeps growing while the agent hasn't handed off yet.
         if phase == PHASE_AUTHORING:
-            return {"content": _nudge()}
+            store.set_usage(session_id, _estimate_usage(engine, conversation_history))
+            return {"content": _marker()}
         return None
 
     usage = _estimate_usage(engine, conversation_history)
     if usage >= engine.soft_ratio:
         store.set_phase(session_id, PHASE_AUTHORING)
+        store.set_usage(session_id, usage)
         logger.info(
-            "Handoff: context at %.0f%% (~%s/%s tokens) for %s — nudging toward "
-            "a self-handoff.",
+            "Handoff: context at %.0f%% (~%s/%s tokens) for %s — requesting a "
+            "self-handoff (instruction injected into the user turn).",
             usage * 100,
             f"{getattr(engine, 'last_preflight_tokens', 0):,}",
             f"{getattr(engine, 'context_length', 0):,}",
             session_id,
         )
-        return {"content": _nudge()}
+        return {"content": _marker()}
 
     return None
 
 
-def _nudge() -> str:
+# -- DELIVERY --------------------------------------------------------------
+
+def pre_llm_call_handler(session_id: str = "", **kwargs) -> Optional[Dict[str, Any]]:
+    """Inject the handoff instruction into the USER message.
+
+    Returns ``{"context": ...}``; Hermes appends it to the user turn. This is the
+    escalation that makes the automatic path actually convert — the same reason
+    the manual ``/self-handoff`` skill works and an ambient system-prompt nudge
+    does not.
+    """
+    if not session_id:
+        return None
+
+    # No `agent` here — reach the shared state directly. Every engine deep-copy
+    # and both hooks operate on the same module-level dict.
+    from .state import HandoffStore
+
+    store = HandoffStore()
+    if store.get_phase(session_id) != PHASE_AUTHORING:
+        return None
+
+    usage = store.get_usage(session_id)
+    return {"context": _instruction(usage)}
+
+
+# -- Text ------------------------------------------------------------------
+
+def _marker() -> str:
+    """Short, hash-stable system-prompt marker. The imperative lives in the
+    user-message injection; this only keeps the state visible in context."""
     return (
-        "⚠️ CONTEXT IS FILLING UP. Soon this session will hit its limit and lose "
-        "context to a lossy reset. Before that happens, wrap up cleanly and hand "
-        "off to your successor: write a complete handoff (follow your "
-        "`writing-a-self-handoff` skill), save it to a file, and call the "
-        "`finalize_handoff` tool with that path — the session will then reset into "
-        "a fresh context seeded with your handoff. Prefer doing this at the next "
-        "natural pause rather than mid-step. (The user can also trigger it "
-        "explicitly with the `/self-handoff` skill.)"
+        "[Context handoff pending: this session has crossed its handoff threshold. "
+        "Write your successor handoff and call `finalize_handoff` — see the "
+        "instruction in the current turn.]"
     )
+
+
+def _instruction(usage: float) -> str:
+    pct = int(round(usage * 100))
+
+    if usage >= URGENT_USAGE:
+        head = (
+            f"🛑 STOP — CONTEXT HANDOFF REQUIRED NOW. This session is at ~{pct}% of its "
+            "context window and is within a turn or two of a hard limit. If you hit it, "
+            "there is no graceful summary: the transcript is chopped to the last handful "
+            "of messages and everything else is lost. Do not continue the current task."
+        )
+        pause = (
+            "Do this THIS TURN, before anything else. If you are mid-step, that is fine "
+            "and expected — capture the in-progress state in the handoff itself rather "
+            "than trying to finish first."
+        )
+    else:
+        head = (
+            f"⚠️ CONTEXT HANDOFF REQUESTED. This session is at ~{pct}% of its context "
+            "window. Rather than let it drift into a lossy truncation, hand off to a "
+            "fresh instance of yourself now."
+        )
+        pause = (
+            "Finish only what is needed to leave a clean state — do not start anything "
+            "new — then do this before continuing."
+        )
+
+    return f"""{head}
+
+{pause}
+
+1. Write a COMPLETE successor handoff. Follow your `writing-a-self-handoff` skill
+   for how to write it well (load it with `skill_view` if it isn't in context).
+   Write for a reader with your capabilities and none of this session's memory:
+   lead with the traps, the current verified state, key files/paths, decisions and
+   dead-ends, ordered next steps, and anything you owe that isn't done.
+2. Save it to a markdown file using your file-editing tools.
+3. Call the `finalize_handoff` tool with `confirm: true` and `path:` set to the
+   exact file you wrote.
+4. Then stop and end your turn. The session resets into a fresh context seeded
+   with your handoff, and next-you continues from it.
+
+This document is the only thing that crosses the reset. Everything you learned
+here that isn't in it is lost."""

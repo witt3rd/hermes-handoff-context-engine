@@ -33,10 +33,21 @@ Three cooperating pieces:
 | **`finalize_handoff` tool** (the engine) | The agent writes the handoff to a file it chooses, then calls this with the path. Marks the session *ready*. |
 | **`compress()`** (the engine) | On the next turn, discards the whole transcript and returns a fresh seed = system prompt + the authored handoff. **No LLM call** — the intelligence was produced by the real agent. |
 
-Plus a best-effort automatic path: a **`system_prompt` hook** watches *live*
-context usage and, past a soft threshold, nudges the agent toward a handoff.
-The nudge is weaker than the skill (a system-prompt line can be deferred), so
-it's a backstop, not the main path.
+Plus an **automatic path**, split across two hooks for the same reason the
+manual trigger is a skill — delivery strength:
+
+- **`system_prompt` hook — detection.** It receives `agent`, so it reads the
+  engine's live token count and flips the session to *authoring* past the soft
+  threshold.
+- **`pre_llm_call` hook — delivery.** Hermes injects this hook's return into the
+  **user message** rather than the system prompt. That's what actually gets
+  acted on. The instruction escalates in urgency as usage climbs.
+
+This split exists because the first version nudged via ambient system-prompt
+text: in live use it fired correctly at 55% and 58% and converted **zero** times
+out of two. A busy agent defers ambient text; a user-turn instruction it does
+not. (`pre_llm_call` receives no `agent`, so the two hooks communicate through
+the shared in-process state.)
 
 ```
 /self-handoff skill ─▶ authoritative user turn ─▶ agent writes handoff + finalize_handoff(path)
@@ -174,12 +185,18 @@ model and full toolset.
 
 ## Known limitations
 
-- **The automatic (threshold) path is best-effort.** The `system_prompt` nudge
-  is weaker than the skill turn; a busy agent may defer it. It exists as a
-  backstop. For a guaranteed handoff, invoke the `/self-handoff` skill — that's
-  an authoritative user turn. If neither fires and context hits the hard
-  threshold, the safety-net truncation keeps the session alive (but that reset
-  is lossy — the whole point is to hand off *before* then).
+- **The automatic path still depends on the agent complying.** It now injects
+  into the user message (`pre_llm_call`) rather than the system prompt, which is
+  the strongest channel a plugin has — but it is an instruction, not a
+  guarantee. For a certain handoff, invoke the `/self-handoff` skill. If nothing
+  converts and context reaches the hard threshold, the safety-net truncation
+  keeps the session alive (that reset is lossy — the whole point is to hand off
+  *before* then, and it now logs loudly when it happens).
+- **Resumed sessions can arrive past the soft threshold.** In-process state is
+  cleared on gateway restart, so a long-lived session that comes back at, say,
+  77% is already `normal` with no history. It gets the urgent-tier instruction
+  on its next turn, but if it crosses the hard threshold first, it is truncated
+  without ever having been asked.
 
 ---
 
