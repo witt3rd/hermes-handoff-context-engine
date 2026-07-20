@@ -64,17 +64,28 @@ class HandoffContextEngine(ContextEngine):
         # soft: ask the agent to author its handoff while it still has room and
         #       full tool access. hard: safety net so we never blow the window.
         #
-        # Sizing the runway (measured, not guessed): an actively working session
-        # grows ~36k tokens/min, and a handoff converts in ~90s — so authoring
-        # costs ~55k tokens of growth. ~150k of runway is therefore ~2.7x what a
-        # handoff actually needs.
+        # Sizing the runway. Measured on clean foreground turns (a session's own
+        # API calls, excluding background-review forks that share the session_id
+        # and read a far larger pre-compression transcript): ~3.2k tokens/min.
+        # A handoff converts in ~90s, so authoring costs ~5k tokens of growth.
         #
-        # Do NOT set this low "to be safe": firing early is not free. Every
-        # handoff trades the whole live working context for a ~7-9k document, and
-        # interrupts real work to do it. At 0.50 on a 1M window this fired every
-        # ~15 minutes and reset sessions that had 480k of headroom left.
-        self.soft_ratio = 0.65
-        self.hard_ratio = 0.80
+        # An earlier revision used ~36k/min and set soft to 0.50/0.65. That rate
+        # was contaminated by fork readings — off by 10x — and the over-provisioned
+        # runway cost real working context: firing early is NOT free. Every handoff
+        # trades the entire live context for a ~7-9k document and interrupts work
+        # to do it.
+        #
+        # So trigger late. At 0.85 on a 1M window there is still ~150k to the wall
+        # — ~45 minutes of clean growth for something that takes 90 seconds.
+        #
+        # The residual risk is BURST, not average rate: one turn reading several
+        # large files can add 100k+ at once and leap a threshold outright. That is
+        # what hard_ratio's margin is for — 0.90 leaves 100k before the model's
+        # limit. If you see `LOSSY SAFETY TRUNCATION` in the log, a burst beat the
+        # handoff and these should come down; the log line carries the exact token
+        # count so that decision can be arithmetic rather than guesswork.
+        self.soft_ratio = 0.85
+        self.hard_ratio = 0.90
         # Host preflight math uses threshold_percent; point it at the hard net.
         self.threshold_percent = self.hard_ratio
 

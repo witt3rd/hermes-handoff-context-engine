@@ -158,8 +158,8 @@ hermes -p <your-profile> gateway run --replace
 |---|---|---|
 | `context.engine` | `"compressor"` | Set to `"handoff"` to activate |
 | `plugins.enabled` | `[]` | Must include `"handoff"` |
-| `soft_ratio` (constant in `engine.py`) | `0.65` | Fraction of context at which the agent is nudged to author its handoff |
-| `hard_ratio` (constant in `engine.py`) | `0.80` | Safety net; lossily truncates if no handoff was produced by here |
+| `soft_ratio` (constant in `engine.py`) | `0.85` | Fraction of context at which the agent is nudged to author its handoff |
+| `hard_ratio` (constant in `engine.py`) | `0.90` | Safety net; lossily truncates if no handoff was produced by here |
 
 Both thresholds are measured against the **authoritative** live request size —
 the preflight token count Hermes itself uses — captured in `should_compress()`.

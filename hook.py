@@ -34,11 +34,14 @@ try:
 except Exception:  # pragma: no cover - defensive
     estimate_messages_tokens_rough = None
 
-# Above this fraction of the context window the situation is no longer "wrap up
-# at a natural pause" — a couple of big turns can hit the wall, so the injected
-# instruction escalates to stop-now. Must sit BETWEEN soft_ratio and hard_ratio:
-# below soft it would never be reached, above hard the truncation beats it.
-URGENT_USAGE = 0.75
+# Above this fraction the injected instruction escalates from "wrap up at a
+# natural pause" to stop-now. Must not sit below soft_ratio (unreachable) or
+# above hard_ratio (the truncation beats it).
+#
+# Set equal to soft_ratio deliberately: with the trigger at 0.85 there is no
+# leisurely tier left — anything that fires is already close enough to the wall
+# that "finish what you're doing first" is the wrong advice.
+URGENT_USAGE = 0.85
 
 
 def _is_forked_agent(agent: Any) -> bool:
