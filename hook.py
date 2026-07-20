@@ -38,18 +38,35 @@ def _resolve_engine(agent: Any) -> Optional[Any]:
 
 
 def _estimate_usage(engine: Any, conversation_history: List[Dict[str, Any]]) -> float:
+    """Fraction of the context window currently in use.
+
+    Source of truth, in order:
+
+    1. ``last_preflight_tokens`` — the AUTHORITATIVE live request size the host
+       passed to ``should_compress()`` earlier this same turn (turn_context runs
+       the compression check before this hook). This is the number Hermes itself
+       decides on, so it is exact.
+    2. ``estimate_messages_tokens_rough`` — only if we haven't seen a preflight
+       number yet. It under-counts structured tool-result blocks badly, which is
+       why it is NOT the primary source: a session measured at 812k real tokens
+       estimated under 600k here, so the soft threshold never tripped and the
+       lossy truncation won instead of a handoff.
+    3. ``last_prompt_tokens`` — last resort; lags a full turn behind.
+    """
     ctx_len = getattr(engine, "context_length", 0) or 0
     if not ctx_len:
         return 0.0
-    tokens = 0
-    if estimate_messages_tokens_rough and conversation_history:
+
+    tokens = getattr(engine, "last_preflight_tokens", 0) or 0
+
+    if not tokens and estimate_messages_tokens_rough and conversation_history:
         try:
             tokens = estimate_messages_tokens_rough(conversation_history)
         except Exception:
             tokens = 0
-    # Fall back to the (lagging) last_prompt_tokens only if we can't estimate.
     if not tokens:
         tokens = getattr(engine, "last_prompt_tokens", 0) or 0
+
     return tokens / ctx_len if ctx_len else 0.0
 
 
@@ -80,8 +97,12 @@ def system_prompt_handler(
     if usage >= engine.soft_ratio:
         store.set_phase(session_id, PHASE_AUTHORING)
         logger.info(
-            "Handoff: context at %.0f%% for %s — nudging toward a self-handoff.",
-            usage * 100, session_id,
+            "Handoff: context at %.0f%% (~%s/%s tokens) for %s — nudging toward "
+            "a self-handoff.",
+            usage * 100,
+            f"{getattr(engine, 'last_preflight_tokens', 0):,}",
+            f"{getattr(engine, 'context_length', 0):,}",
+            session_id,
         )
         return {"content": _nudge()}
 

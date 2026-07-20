@@ -51,18 +51,32 @@ class HandoffContextEngine(ContextEngine):
         self.context_length = 0
         self.compression_count = 0
 
+        # The AUTHORITATIVE live request size, captured from the preflight
+        # number the host passes to should_compress(). This is the same figure
+        # Hermes uses for its own "Pre-API compression: ~N tokens >= threshold"
+        # decision, so it is exact where our own estimates are not:
+        # last_prompt_tokens lags a turn, and estimate_messages_tokens_rough()
+        # badly under-counts structured tool-result blocks. The soft-threshold
+        # nudge (hook.py) reads THIS.
+        self.last_preflight_tokens = 0
+
         # -- Thresholds ------------------------------------------------------
         # soft: ask the agent to author its handoff while it still has room and
         #       full tool access. hard: safety net so we never blow the window.
-        self.soft_ratio = 0.60
+        # Keep generous runway between them: a single turn with large tool
+        # results can add hundreds of thousands of tokens, and if usage leaps
+        # from below soft to past hard in one turn the nudge never gets a turn
+        # to land and the lossy truncation wins.
+        self.soft_ratio = 0.50
         self.hard_ratio = 0.80
         # Host preflight math uses threshold_percent; point it at the hard net.
         self.threshold_percent = self.hard_ratio
 
         # We fully own the returned message list, so head/tail protection is a
-        # no-op for the handoff swap; it only matters for the safety fallback.
+        # no-op for the handoff swap; it only matters for the safety fallback —
+        # where a bigger tail meaningfully softens an already-lossy chop.
         self.protect_first_n = 0
-        self.protect_last_n = 8
+        self.protect_last_n = 16
 
         # -- Session-scoped resources ---------------------------------------
         self.store: Optional[HandoffStore] = None
@@ -132,6 +146,14 @@ class HandoffContextEngine(ContextEngine):
         directive lives in the system prompt (hook.py), not here, so the agent
         keeps its full transcript and tools until it finalizes.
         """
+        # Capture the host's authoritative live request size before anything
+        # else — the soft-threshold nudge in hook.py depends on it, and this is
+        # the only place Hermes hands it to us. Record it even when we go on to
+        # return False (the common case, which is exactly when the nudge needs
+        # a fresh number).
+        if prompt_tokens:
+            self.last_preflight_tokens = prompt_tokens
+
         if not self.store or not self.session_id:
             return False
 
@@ -233,7 +255,20 @@ class HandoffContextEngine(ContextEngine):
         self.store.set_phase(self.session_id, PHASE_NORMAL)
         self.store.set_handoff_path(self.session_id, None)
         self.compression_count += 1
-        return system_msgs + [note] + tail
+
+        result = system_msgs + [note] + tail
+        # Loud on purpose: this is the lossy path this plugin exists to avoid.
+        # If you see this, the handoff never got authored — investigate why the
+        # soft-threshold nudge didn't convert.
+        logger.warning(
+            "Handoff: LOSSY SAFETY TRUNCATION for %s — %d messages -> %d "
+            "(preflight ~%s tokens). No authored handoff existed; context was "
+            "chopped to the last %d messages.",
+            self.session_id, len(messages), len(result),
+            f"{self.last_preflight_tokens:,}" if self.last_preflight_tokens else "unknown",
+            self.protect_last_n,
+        )
+        return result
 
     # -- Tool surface: finalize_handoff ------------------------------------
 

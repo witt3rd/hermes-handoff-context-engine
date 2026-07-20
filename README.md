@@ -147,8 +147,19 @@ hermes -p <your-profile> gateway run --replace
 |---|---|---|
 | `context.engine` | `"compressor"` | Set to `"handoff"` to activate |
 | `plugins.enabled` | `[]` | Must include `"handoff"` |
-| `soft_ratio` (constant in `engine.py`) | `0.60` | Fraction of context at which the agent is asked to author its handoff |
-| `hard_ratio` (constant in `engine.py`) | `0.80` | Safety net; truncates if no handoff was produced by here |
+| `soft_ratio` (constant in `engine.py`) | `0.50` | Fraction of context at which the agent is nudged to author its handoff |
+| `hard_ratio` (constant in `engine.py`) | `0.80` | Safety net; lossily truncates if no handoff was produced by here |
+
+Both thresholds are measured against the **authoritative** live request size —
+the preflight token count Hermes itself uses — captured in `should_compress()`.
+Earlier versions estimated locally and under-counted structured tool-result
+blocks badly enough that the soft threshold never tripped (a real 812k-token
+session estimated under 600k), so sessions silently took the lossy truncation
+instead of handing off. Don't reintroduce a local estimate as the primary source.
+
+Keep generous runway between soft and hard: one turn with large tool results can
+add hundreds of thousands of tokens, and if usage leaps from below soft to past
+hard in a single turn, the nudge never gets a turn to land.
 
 The soft/hard ratios are currently constants in `engine.py`. Leave headroom
 between `soft` and `hard` so the agent has room and tools to write a good
