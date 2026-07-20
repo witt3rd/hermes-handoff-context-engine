@@ -41,6 +41,40 @@ except Exception:  # pragma: no cover - defensive
 URGENT_USAGE = 0.75
 
 
+def _is_forked_agent(agent: Any) -> bool:
+    """True for a background fork that SHARES the parent's session_id.
+
+    Hermes' background review runs in a forked AIAgent that deliberately adopts
+    the parent's ``session_id`` for prompt-cache warmth
+    (``background_review.py``: ``review_agent.session_id = agent.session_id``),
+    while reviewing the *pre-compression* conversation — so its context can be
+    an order of magnitude larger than the live foreground session.
+
+    Because this plugin keys all state by ``session_id``, a fork's token count
+    would otherwise be attributed to the parent: the fork trips the soft
+    threshold, the parent gets marked ``authoring``, and the *foreground* agent
+    is told to hand off while it is still small. Observed live as a handoff loop
+    — a session that had just reset to ~47k was told to hand off again minutes
+    later on the fork's ~530k reading.
+
+    ``_persist_disabled`` is the reliable marker: ``agent_init`` sets it False
+    for every real agent and only the review fork sets it True — it exists
+    precisely to stop a session_id-sharing fork from writing shared state, which
+    is exactly what we must not do either.
+    """
+    if getattr(agent, "_persist_disabled", False):
+        return True
+    if getattr(agent, "_memory_write_origin", "") == "background_review":
+        return True
+    return False
+
+
+# The background review's harness prompt. pre_llm_call receives no `agent`, so
+# this is the only way to avoid injecting the handoff instruction into a review
+# turn (which would make the reviewer try to write a handoff).
+_REVIEW_PROMPT_MARKER = "review the conversation above and update the skill library"
+
+
 def _resolve_engine(agent: Any) -> Optional[Any]:
     # The live per-agent engine is at .context_compressor (Hermes deep-copies the
     # registered engine per agent). ._context_engine is NOT set by the host.
@@ -87,6 +121,11 @@ def system_prompt_handler(
     conversation_history: List[Dict[str, Any]],
     **kwargs,
 ) -> Optional[Dict[str, Any]]:
+    # A background fork shares the parent's session_id but carries a different
+    # (usually far larger) context. Never let its size decide the parent's fate.
+    if _is_forked_agent(agent):
+        return None
+
     engine = _resolve_engine(agent)
     if engine is None:
         return None
@@ -133,6 +172,14 @@ def pre_llm_call_handler(session_id: str = "", **kwargs) -> Optional[Dict[str, A
     does not.
     """
     if not session_id:
+        return None
+
+    # pre_llm_call gets no `agent`, so a forked review turn can't be identified
+    # structurally — but it is recognisable by its harness prompt. Without this,
+    # a legitimately-authoring parent would inject "write your handoff now" into
+    # the *reviewer's* turn and the reviewer would try to write one.
+    user_message = kwargs.get("user_message") or ""
+    if _REVIEW_PROMPT_MARKER in str(user_message).lower():
         return None
 
     # No `agent` here — reach the shared state directly. Every engine deep-copy
