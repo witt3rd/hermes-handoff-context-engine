@@ -63,11 +63,17 @@ class HandoffContextEngine(ContextEngine):
         # -- Thresholds ------------------------------------------------------
         # soft: ask the agent to author its handoff while it still has room and
         #       full tool access. hard: safety net so we never blow the window.
-        # Keep generous runway between them: a single turn with large tool
-        # results can add hundreds of thousands of tokens, and if usage leaps
-        # from below soft to past hard in one turn the nudge never gets a turn
-        # to land and the lossy truncation wins.
-        self.soft_ratio = 0.50
+        #
+        # Sizing the runway (measured, not guessed): an actively working session
+        # grows ~36k tokens/min, and a handoff converts in ~90s — so authoring
+        # costs ~55k tokens of growth. ~150k of runway is therefore ~2.7x what a
+        # handoff actually needs.
+        #
+        # Do NOT set this low "to be safe": firing early is not free. Every
+        # handoff trades the whole live working context for a ~7-9k document, and
+        # interrupts real work to do it. At 0.50 on a 1M window this fired every
+        # ~15 minutes and reset sessions that had 480k of headroom left.
+        self.soft_ratio = 0.65
         self.hard_ratio = 0.80
         # Host preflight math uses threshold_percent; point it at the hard net.
         self.threshold_percent = self.hard_ratio

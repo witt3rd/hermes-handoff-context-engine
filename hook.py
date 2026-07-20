@@ -36,8 +36,9 @@ except Exception:  # pragma: no cover - defensive
 
 # Above this fraction of the context window the situation is no longer "wrap up
 # at a natural pause" — a couple of big turns can hit the wall, so the injected
-# instruction escalates to stop-now.
-URGENT_USAGE = 0.68
+# instruction escalates to stop-now. Must sit BETWEEN soft_ratio and hard_ratio:
+# below soft it would never be reached, above hard the truncation beats it.
+URGENT_USAGE = 0.75
 
 
 def _resolve_engine(agent: Any) -> Optional[Any]:
