@@ -29,7 +29,8 @@ _STATE: Dict[str, dict] = {}
 def _entry(session_id: str) -> dict:
     e = _STATE.get(session_id)
     if e is None:
-        e = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0, "usage": 0.0}
+        e = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0,
+             "usage": 0.0, "urgent": False}
         _STATE[session_id] = e
     return e
 
@@ -71,6 +72,20 @@ class HandoffStore:
         with _LOCK:
             _entry(session_id)["usage"] = usage
 
+    def get_urgent(self, session_id: str) -> bool:
+        """Whether the injected instruction should use the stop-now tier.
+
+        Decided by the detection hook (which can see the engine's configured
+        ``urgent_ratio``) and carried here because the delivery hook receives no
+        ``agent`` and therefore cannot read the threshold itself.
+        """
+        with _LOCK:
+            return bool(_entry(session_id).get("urgent", False))
+
+    def set_urgent(self, session_id: str, urgent: bool) -> None:
+        with _LOCK:
+            _entry(session_id)["urgent"] = bool(urgent)
+
     def get_swap_count(self, session_id: str) -> int:
         with _LOCK:
             return _entry(session_id)["swap_count"]
@@ -83,5 +98,5 @@ class HandoffStore:
         with _LOCK:
             _STATE[session_id] = {
                 "phase": PHASE_NORMAL, "handoff_path": None,
-                "swap_count": 0, "usage": 0.0,
+                "swap_count": 0, "usage": 0.0, "urgent": False,
             }

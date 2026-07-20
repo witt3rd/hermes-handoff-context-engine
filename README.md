@@ -154,27 +154,70 @@ hermes -p <your-profile> gateway run --replace
 
 ## Configuration reference
 
+```yaml
+context:
+  engine: handoff
+  handoff:                 # all optional — these are the defaults
+    soft_ratio: 0.85       # request a handoff at this fraction of the window
+    urgent_ratio: 0.85     # at/above this the instruction becomes "stop now"
+    hard_ratio: 0.90       # safety net: lossy truncation if no handoff exists
+    protect_last_n: 16     # tail kept when the safety net fires
+```
+
 | Setting | Default | Description |
 |---|---|---|
 | `context.engine` | `"compressor"` | Set to `"handoff"` to activate |
 | `plugins.enabled` | `[]` | Must include `"handoff"` |
-| `soft_ratio` (constant in `engine.py`) | `0.85` | Fraction of context at which the agent is nudged to author its handoff |
-| `hard_ratio` (constant in `engine.py`) | `0.90` | Safety net; lossily truncates if no handoff was produced by here |
+| `context.handoff.soft_ratio` | `0.85` | Where the agent is asked to author its handoff |
+| `context.handoff.urgent_ratio` | = `soft_ratio` | Where the instruction escalates to stop-now |
+| `context.handoff.hard_ratio` | `0.90` | Safety net; lossily truncates if no handoff was produced |
+| `context.handoff.protect_last_n` | `16` | Messages kept if the safety net fires |
 
-Both thresholds are measured against the **authoritative** live request size —
-the preflight token count Hermes itself uses — captured in `should_compress()`.
-Earlier versions estimated locally and under-counted structured tool-result
-blocks badly enough that the soft threshold never tripped (a real 812k-token
-session estimated under 600k), so sessions silently took the lossy truncation
-instead of handing off. Don't reintroduce a local estimate as the primary source.
+`soft ≤ urgent ≤ hard` is enforced at load. Violations are clamped with a
+warning rather than crashing — an inverted pair is a silent killer (soft above
+hard means the truncation fires before a handoff is ever requested). The
+effective values are logged at startup, so `grep 'Handoff: thresholds'` always
+tells you what's actually live.
 
-Keep generous runway between soft and hard: one turn with large tool results can
-add hundreds of thousands of tokens, and if usage leaps from below soft to past
-hard in a single turn, the nudge never gets a turn to land.
+### ⚠️ `compression.*` does not configure this engine
 
-The soft/hard ratios are currently constants in `engine.py`. Leave headroom
-between `soft` and `hard` so the agent has room and tools to write a good
-handoff before the safety net trips.
+When a plugin engine is active, Hermes forwards **none** of the `compression.*`
+settings to it — `compression.threshold`, `target_ratio`, `protect_first_n`,
+`protect_last_n` etc. only configure the built-in `ContextCompressor`
+(`agent_init.py`: *"external engines own compaction policy"*). Setting
+`compression.threshold: 0.7` will not move the handoff trigger; use
+`context.handoff.soft_ratio`.
+
+The one exception is **`compression.enabled`**, which still matters — and is a
+footgun:
+
+```yaml
+compression:
+  enabled: false     # ← disables this engine entirely
+```
+
+Every compaction trigger gates on it, so `false` means no handoff **and no
+safety net** — sessions run into the model's hard limit and fail. With a plugin
+engine, `enabled` no longer means "use the built-in compressor," it means "allow
+compaction at all."
+
+### Choosing thresholds
+
+Both are measured against the **authoritative** live request size — the preflight
+token count Hermes itself uses — captured in `should_compress()`. Earlier versions
+estimated locally and under-counted structured tool-result blocks badly enough
+that the soft threshold never tripped (a real 812k-token session estimated under
+600k), so sessions silently took the lossy truncation instead of handing off.
+Don't reintroduce a local estimate as the primary source.
+
+Firing early is **not** free: every handoff trades the entire live context for a
+~8k document and interrupts real work. Measured on clean foreground turns, an
+active session grows ~3.2k tokens/min and a handoff converts in ~90s, so the
+runway needed is small — which is why the default triggers late. The residual
+risk is **burst** (one turn reading several large files can add 100k+ at once),
+which is what the `hard_ratio` margin absorbs. If `LOSSY SAFETY TRUNCATION`
+appears in the log, a burst beat the handoff and these should come down; that log
+line carries the exact token count so the adjustment can be arithmetic.
 
 Unlike the built-in compressor (and unlike observational-memory's background
 passes), **the handoff engine makes no side-channel LLM calls of its own** — the

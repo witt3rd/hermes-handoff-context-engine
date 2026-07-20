@@ -31,6 +31,33 @@ from .state import HandoffStore, PHASE_NORMAL, PHASE_AUTHORING, PHASE_READY
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SOFT_RATIO = 0.85
+DEFAULT_HARD_RATIO = 0.90
+DEFAULT_PROTECT_LAST_N = 16
+
+
+def _load_settings() -> Dict[str, Any]:
+    """Read ``context.handoff.*`` from the active profile's config.yaml.
+
+    Deliberately a private namespace rather than reusing ``compression.*``:
+    when a plugin engine is active Hermes forwards NONE of the compression
+    settings to it (agent_init.py — "external engines own compaction policy"),
+    and ``compression.threshold`` means one threshold where this engine has two
+    with different semantics. Only ``compression.enabled`` still matters, and it
+    gates compaction entirely — if it is false this engine is never called.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return {}
+    ctx = cfg.get("context") if isinstance(cfg, dict) else None
+    if not isinstance(ctx, dict):
+        return {}
+    settings = ctx.get("handoff")
+    return settings if isinstance(settings, dict) else {}
+
+
 SWAP_MARKER = "[CONTEXT HANDOFF — FRESH SESSION SEEDED FROM AGENT-AUTHORED HANDOFF]"
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -84,8 +111,13 @@ class HandoffContextEngine(ContextEngine):
         # limit. If you see `LOSSY SAFETY TRUNCATION` in the log, a burst beat the
         # handoff and these should come down; the log line carries the exact token
         # count so that decision can be arithmetic rather than guesswork.
-        self.soft_ratio = 0.85
-        self.hard_ratio = 0.90
+        #
+        # Overridable via `context.handoff.*` in config.yaml — see _apply_settings.
+        # (Note: `compression.*` does NOT reach a plugin engine; only
+        # `compression.enabled` matters, and it gates compaction entirely.)
+        self.soft_ratio = DEFAULT_SOFT_RATIO
+        self.hard_ratio = DEFAULT_HARD_RATIO
+        self.urgent_ratio = DEFAULT_SOFT_RATIO
         # Host preflight math uses threshold_percent; point it at the hard net.
         self.threshold_percent = self.hard_ratio
 
@@ -93,7 +125,10 @@ class HandoffContextEngine(ContextEngine):
         # no-op for the handoff swap; it only matters for the safety fallback —
         # where a bigger tail meaningfully softens an already-lossy chop.
         self.protect_first_n = 0
-        self.protect_last_n = 16
+        self.protect_last_n = DEFAULT_PROTECT_LAST_N
+
+        # Apply config overrides last so they win over every default above.
+        self._apply_settings()
 
         # -- Session-scoped resources ---------------------------------------
         self.store: Optional[HandoffStore] = None
@@ -104,6 +139,69 @@ class HandoffContextEngine(ContextEngine):
     @property
     def name(self) -> str:
         return self._name
+
+    # -- Settings ----------------------------------------------------------
+
+    def _apply_settings(self) -> None:
+        """Load `context.handoff.*` overrides, validating the ordering invariant.
+
+        soft <= urgent <= hard must hold. Violations are silent killers: with
+        soft above hard the safety net truncates before a handoff is ever
+        requested, and with urgent outside the band its tier is unreachable
+        (we shipped exactly that bug once). Clamp rather than crash — but say so
+        loudly, and always log the effective values so there is never ambiguity
+        about which numbers are live.
+        """
+        s = _load_settings()
+
+        def _num(key, default, cast=float):
+            try:
+                return cast(s[key]) if key in s else default
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Handoff: context.handoff.%s=%r is not a number; using %r.",
+                    key, s.get(key), default,
+                )
+                return default
+
+        soft = _num("soft_ratio", DEFAULT_SOFT_RATIO)
+        hard = _num("hard_ratio", DEFAULT_HARD_RATIO)
+        urgent = _num("urgent_ratio", soft)
+        protect = _num("protect_last_n", DEFAULT_PROTECT_LAST_N, int)
+
+        if not 0.0 < soft < 1.0 or not 0.0 < hard < 1.0:
+            logger.warning(
+                "Handoff: ratios must be between 0 and 1 (got soft=%s hard=%s); "
+                "falling back to defaults.", soft, hard,
+            )
+            soft, hard, urgent = DEFAULT_SOFT_RATIO, DEFAULT_HARD_RATIO, DEFAULT_SOFT_RATIO
+        if soft >= hard:
+            lowered = max(0.01, round(hard - 0.05, 4))
+            logger.warning(
+                "Handoff: soft_ratio (%s) must be below hard_ratio (%s), or the "
+                "safety net truncates before a handoff is ever requested; "
+                "lowering soft to %s.", soft, hard, lowered,
+            )
+            soft = lowered
+        if not soft <= urgent <= hard:
+            clamped = min(max(urgent, soft), hard)
+            logger.warning(
+                "Handoff: urgent_ratio (%s) must sit within [%s, %s]; clamping to %s.",
+                urgent, soft, hard, clamped,
+            )
+            urgent = clamped
+
+        self.soft_ratio = soft
+        self.hard_ratio = hard
+        self.urgent_ratio = urgent
+        self.protect_last_n = max(1, protect)
+        self.threshold_percent = self.hard_ratio
+
+        logger.info(
+            "Handoff: thresholds soft=%.2f urgent=%.2f hard=%.2f protect_last_n=%d%s",
+            self.soft_ratio, self.urgent_ratio, self.hard_ratio, self.protect_last_n,
+            "" if s else " (defaults — no context.handoff block in config.yaml)",
+        )
 
     # -- Lifecycle ---------------------------------------------------------
 

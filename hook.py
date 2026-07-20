@@ -34,13 +34,12 @@ try:
 except Exception:  # pragma: no cover - defensive
     estimate_messages_tokens_rough = None
 
-# Above this fraction the injected instruction escalates from "wrap up at a
-# natural pause" to stop-now. Must not sit below soft_ratio (unreachable) or
-# above hard_ratio (the truncation beats it).
-#
-# Set equal to soft_ratio deliberately: with the trigger at 0.85 there is no
-# leisurely tier left — anything that fires is already close enough to the wall
-# that "finish what you're doing first" is the wrong advice.
+# Fallback only. The live value is the engine's `urgent_ratio` (configurable via
+# context.handoff.urgent_ratio and validated to sit within [soft, hard]). Above
+# it the injected instruction escalates from "wrap up at a natural pause" to
+# stop-now. With the trigger late (0.85) urgent defaults to == soft, because
+# anything that fires is already close enough to the wall that "finish what
+# you're doing first" is the wrong advice.
 URGENT_USAGE = 0.85
 
 
@@ -143,7 +142,9 @@ def system_prompt_handler(
         # Keep usage fresh so the injected instruction's urgency tracks reality
         # as the session keeps growing while the agent hasn't handed off yet.
         if phase == PHASE_AUTHORING:
-            store.set_usage(session_id, _estimate_usage(engine, conversation_history))
+            live = _estimate_usage(engine, conversation_history)
+            store.set_usage(session_id, live)
+            store.set_urgent(session_id, live >= getattr(engine, "urgent_ratio", URGENT_USAGE))
             return {"content": _marker()}
         return None
 
@@ -151,6 +152,7 @@ def system_prompt_handler(
     if usage >= engine.soft_ratio:
         store.set_phase(session_id, PHASE_AUTHORING)
         store.set_usage(session_id, usage)
+        store.set_urgent(session_id, usage >= getattr(engine, "urgent_ratio", URGENT_USAGE))
         logger.info(
             "Handoff: context at %.0f%% (~%s/%s tokens) for %s — requesting a "
             "self-handoff (instruction injected into the user turn).",
@@ -193,8 +195,8 @@ def pre_llm_call_handler(session_id: str = "", **kwargs) -> Optional[Dict[str, A
     if store.get_phase(session_id) != PHASE_AUTHORING:
         return None
 
-    usage = store.get_usage(session_id)
-    return {"context": _instruction(usage)}
+    return {"context": _instruction(store.get_usage(session_id),
+                                    store.get_urgent(session_id))}
 
 
 # -- Text ------------------------------------------------------------------
@@ -209,10 +211,10 @@ def _marker() -> str:
     )
 
 
-def _instruction(usage: float) -> str:
+def _instruction(usage: float, urgent: bool) -> str:
     pct = int(round(usage * 100))
 
-    if usage >= URGENT_USAGE:
+    if urgent:
         head = (
             f"🛑 STOP — CONTEXT HANDOFF REQUIRED NOW. This session is at ~{pct}% of its "
             "context window and is within a turn or two of a hard limit. If you hit it, "
