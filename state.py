@@ -30,7 +30,7 @@ def _entry(session_id: str) -> dict:
     e = _STATE.get(session_id)
     if e is None:
         e = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0,
-             "usage": 0.0, "urgent": False}
+             "usage": 0.0, "urgent": False, "last_handoff": None}
         _STATE[session_id] = e
     return e
 
@@ -94,9 +94,24 @@ class HandoffStore:
         with _LOCK:
             _entry(session_id)["swap_count"] += 1
 
+    def get_last_handoff(self, session_id: str) -> Optional[str]:
+        """The content of the handoff from the most recent swap.
+
+        Feeds the layered-prior lift: when the agent next authors a handoff, it
+        receives this as its predecessor document so still-relevant objectives,
+        decisions, and work carry forward across swaps instead of starting cold.
+        """
+        with _LOCK:
+            return _entry(session_id).get("last_handoff")
+
+    def set_last_handoff(self, session_id: str, content: Optional[str]) -> None:
+        with _LOCK:
+            _entry(session_id)["last_handoff"] = content
+
     def reset(self, session_id: str) -> None:
         with _LOCK:
             _STATE[session_id] = {
                 "phase": PHASE_NORMAL, "handoff_path": None,
                 "swap_count": 0, "usage": 0.0, "urgent": False,
+                "last_handoff": None,
             }

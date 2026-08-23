@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_SOFT_RATIO = 0.85
 DEFAULT_HARD_RATIO = 0.90
 DEFAULT_PROTECT_LAST_N = 16
+# Recent raw transcript retained verbatim across a handoff swap, so the
+# successor has immediate working context (mirrors opencode's `keep.tokens`).
+DEFAULT_KEEP_TOKENS = 8000
 
 
 def _load_settings() -> Dict[str, Any]:
@@ -62,6 +65,33 @@ SWAP_MARKER = "[CONTEXT HANDOFF — FRESH SESSION SEEDED FROM AGENT-AUTHORED HAN
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 FINALIZE_TOOL_NAME = "finalize_handoff"
+
+# The handoff template the agent is asked to author to. Lifted from opencode's
+# compaction SUMMARY_TEMPLATE so the authored document has a stable, machine-
+# parseable shape across swaps — which is what makes the layered prior (carry
+# forward still-relevant sections) and the recent-tail retention composable.
+HANDOFF_TEMPLATE = """## Objective
+- [one or two brief sentences describing what the user is trying to accomplish]
+
+## Important Details
+- [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or "(none)"]
+
+## Work State
+### Completed
+- [finished work, verified facts, or changes made; otherwise "(none)"]
+
+### Active
+- [current work, partial changes, or investigation state; otherwise "(none)"]
+
+### Blocked
+- [blockers, failing commands, or unknowns; otherwise "(none)"]
+
+## Next Move
+1. [immediate concrete action, or "(none)"]
+2. [next action if known, or "(none)"]
+
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]"""
 
 
 class HandoffContextEngine(ContextEngine):
@@ -120,6 +150,7 @@ class HandoffContextEngine(ContextEngine):
         self.urgent_ratio = DEFAULT_SOFT_RATIO
         # Host preflight math uses threshold_percent; point it at the hard net.
         self.threshold_percent = self.hard_ratio
+        self.keep_tokens = DEFAULT_KEEP_TOKENS
 
         # We fully own the returned message list, so head/tail protection is a
         # no-op for the handoff swap; it only matters for the safety fallback —
@@ -168,6 +199,7 @@ class HandoffContextEngine(ContextEngine):
         hard = _num("hard_ratio", DEFAULT_HARD_RATIO)
         urgent = _num("urgent_ratio", soft)
         protect = _num("protect_last_n", DEFAULT_PROTECT_LAST_N, int)
+        keep = _num("keep_tokens", DEFAULT_KEEP_TOKENS, int)
 
         if not 0.0 < soft < 1.0 or not 0.0 < hard < 1.0:
             logger.warning(
@@ -195,11 +227,13 @@ class HandoffContextEngine(ContextEngine):
         self.hard_ratio = hard
         self.urgent_ratio = urgent
         self.protect_last_n = max(1, protect)
+        self.keep_tokens = max(0, keep)
         self.threshold_percent = self.hard_ratio
 
         logger.info(
-            "Handoff: thresholds soft=%.2f urgent=%.2f hard=%.2f protect_last_n=%d%s",
+            "Handoff: thresholds soft=%.2f urgent=%.2f hard=%.2f protect_last_n=%d keep_tokens=%d%s",
             self.soft_ratio, self.urgent_ratio, self.hard_ratio, self.protect_last_n,
+            self.keep_tokens,
             "" if s else " (defaults — no context.handoff block in config.yaml)",
         )
 
@@ -323,8 +357,14 @@ class HandoffContextEngine(ContextEngine):
         if not content:
             return None
 
-        seed: List[Dict[str, Any]] = [m for m in messages if m.get("role") == "system"]
-        seed.append({
+        # Record the handoff for the layered prior before consuming it, so the
+        # NEXT authoring cycle can carry still-relevant state forward.
+        self.store.set_last_handoff(self.session_id, content)
+
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        tail = self._recent_tail([m for m in messages if m.get("role") != "system"])
+
+        handoff_user = {
             "role": "user",
             "content": (
                 f"{SWAP_MARKER}\n\n"
@@ -336,7 +376,20 @@ class HandoffContextEngine(ContextEngine):
                 f"{content}"
             ),
             COMPRESSED_SUMMARY_METADATA_KEY: True,
-        })
+        }
+
+        # Assemble [system] + [handoff seed] + [recent raw tail], preserving
+        # user/assistant alternation. If the retained tail starts with a user
+        # message, fold the handoff seed into it rather than doubling up user
+        # turns; otherwise prepend the seed as its own user message.
+        if tail and tail[0].get("role") == "user":
+            first = dict(tail[0])
+            first["content"] = f"{handoff_user['content']}\n\n{first.get('content', '')}"
+            if COMPRESSED_SUMMARY_METADATA_KEY not in first:
+                first[COMPRESSED_SUMMARY_METADATA_KEY] = True
+            seed = system_msgs + [first] + tail[1:]
+        else:
+            seed = system_msgs + [handoff_user] + tail
 
         # Reset the machine: back to normal, forget the consumed document.
         self.store.set_phase(self.session_id, PHASE_NORMAL)
@@ -345,10 +398,40 @@ class HandoffContextEngine(ContextEngine):
         self.compression_count += 1
 
         logger.info(
-            "Handoff: swapped %d messages for authored handoff (%d chars) from %s",
-            len(messages), len(content), path,
+            "Handoff: swapped %d messages for authored handoff (%d chars) from %s "
+            "keeping %d recent messages (~%s tokens)",
+            len(messages), len(content), path, len(tail),
+            f"{self.keep_tokens:,}" if self.keep_tokens else "none",
         )
         return seed
+
+    def _recent_tail(self, non_system: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep the most recent messages up to ``keep_tokens`` verbatim.
+
+        Mirrors opencode's `keep.tokens`: the handoff swap no longer discards
+        the entire transcript — the tail's immediate working context (the last
+        tool round, the in-flight edit) crosses the reset raw, so the successor
+        is not groping for where it was. At least one message is always kept,
+        even if a single turn exceeds the budget.
+        """
+        if not self.keep_tokens:
+            return []
+        total = 0
+        kept = []
+        for msg in reversed(non_system):
+            cost = self._estimate_tokens(msg)
+            if kept and total + cost > self.keep_tokens:
+                break
+            kept.append(msg)
+            total += cost
+        kept.reverse()
+        return kept
+
+    def _estimate_tokens(self, msg: Dict[str, Any]) -> int:
+        """Rough char-based token estimate for a single message dict."""
+        content = msg.get("content")
+        text = content if isinstance(content, str) else json.dumps(content)
+        return max(1, len(text) // 4)
 
     def _safety_truncate(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Last-resort head/tail keep so the window is never exceeded."""

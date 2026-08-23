@@ -65,6 +65,28 @@ conversation, not the lagging post-response usage.
 Handoff documents are written wherever the agent chooses (it reports the path
 via `finalize_handoff`) and are not deleted, so you also get a durable trail.
 
+### What crosses the reset
+
+Three behaviors borrowed from opencode's compaction engine (`packages/core/src/
+session/compaction.ts`) shape what the successor actually wakes into:
+
+1. **A suggested template.** The directive asks for a handoff in one fixed,
+   machine-parseable structure — `Objective` / `Important Details` / `Work State
+   (Completed, Active, Blocked)` / `Next Move` / `Relevant Files` — so every
+   document has the same shape and the layered prior can be merged reliably.
+2. **Layered prior.** The engine remembers the handoff from the previous swap
+   and hands it to the agent the next time it authors. The new document is
+   framed as *updating a prior* — carry forward the objective, standing
+   decisions, and still-live work, drop only what's finished — rather than
+   starting from nothing each reset.
+3. **Retained recent tail.** The swap no longer discards the whole transcript.
+   The most recent raw turns (up to `keep_tokens`, default 8000) survive
+   verbatim alongside the authored handoff, so the successor has immediate
+   in-flight context (the last tool round, the mid-edit) instead of groping.
+
+The handoff is still the *primary* thing that crosses — the layered prior and the
+raw tail are continuity aids on top of it, not replacements.
+
 ---
 
 ## The handoff-writing skill
@@ -162,6 +184,7 @@ context:
     urgent_ratio: 0.85     # at/above this the instruction becomes "stop now"
     hard_ratio: 0.90       # safety net: lossy truncation if no handoff exists
     protect_last_n: 16     # tail kept when the safety net fires
+    keep_tokens: 8000      # recent transcript retained verbatim across a swap
 ```
 
 | Setting | Default | Description |
@@ -172,6 +195,7 @@ context:
 | `context.handoff.urgent_ratio` | = `soft_ratio` | Where the instruction escalates to stop-now |
 | `context.handoff.hard_ratio` | `0.90` | Safety net; lossily truncates if no handoff was produced |
 | `context.handoff.protect_last_n` | `16` | Messages kept if the safety net fires |
+| `context.handoff.keep_tokens` | `8000` | Most recent raw transcript kept verbatim through a swap (0 = full reset) |
 
 `soft ≤ urgent ≤ hard` is enforced at load. Violations are clamped with a
 warning rather than crashing — an inverted pair is a silent killer (soft above

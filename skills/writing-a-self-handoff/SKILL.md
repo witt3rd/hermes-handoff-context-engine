@@ -136,17 +136,43 @@ current state and headline result first, then what needs action, then the
 gotchas, then the expensive-to-rediscover detail. Never a timeline. The skeleton
 below is already in that order.
 
-## What to cover (skeleton)
+## What to cover (the enforced template)
 
-1. **TL;DR** — where things stand in 2–3 lines; is anything mid-flight?
-2. **Traps & gotchas** — the load-bearing section. What will trip you cold.
-3. **Current verified state** — what's done and *confirmed*, with pointers.
-4. **Key files & locations** — paths, functions, line refs that matter.
-5. **Decisions & rationale** — what you chose and why (flag the overrulable ones).
-6. **Rejected approaches / dead ends** — what NOT to try again, and why.
-7. **Next steps** — concrete, ordered actions.
-8. **Open questions / owed items** — unfinished work and unanswered asks.
-9. **Verify-live-state** — the exact checks to run before building on any of this.
+The engine asks every handoff to fit this exact structure, so it stays readable
+and machine-parseable across resets (it's what lets the layered-prior carry
+forward). Fill every section — even when a section is empty, keep its heading and
+write "(none)". Retrieval-priority ordering is built in: objective and current
+state first, then what needs action, then the gotchas, then the expensive
+recoverable detail.
+
+```markdown
+## Objective
+- [one or two brief sentences describing what the user is trying to accomplish]
+
+## Important Details
+- [constraints/preferences, decisions and why, important facts/assumptions,
+   exact context needed to continue, or "(none)"]
+
+## Work State
+### Completed
+- [finished work, verified facts, or changes made; otherwise "(none)"]
+### Active
+- [current work, partial changes, or investigation state; otherwise "(none)"]
+### Blocked
+- [blockers, failing commands, or unknowns; otherwise "(none)"]
+
+## Next Move
+1. [immediate concrete action, or "(none)"]
+2. [next action if known, or "(none)"]
+
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]
+```
+
+The five moves above still govern the *content* of these sections — the traps
+belong in **Important Details** and **Blocked**, the verified state in **Work
+State / Completed**, the judgment calls and rationale in **Important Details**,
+the still-live traps and owed items across **Blocked** and **Next Move**.
 
 ## Memory hook
 

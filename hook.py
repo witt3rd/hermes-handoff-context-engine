@@ -27,6 +27,11 @@ from typing import Any, Dict, List, Optional
 
 from .state import PHASE_NORMAL, PHASE_AUTHORING, PHASE_READY
 
+try:
+    from .engine import HANDOFF_TEMPLATE
+except Exception:  # pragma: no cover - defensive; engine always importable here
+    HANDOFF_TEMPLATE = ""
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -196,7 +201,8 @@ def pre_llm_call_handler(session_id: str = "", **kwargs) -> Optional[Dict[str, A
         return None
 
     return {"context": _instruction(store.get_usage(session_id),
-                                    store.get_urgent(session_id))}
+                                    store.get_urgent(session_id),
+                                    store.get_last_handoff(session_id))}
 
 
 # -- Text ------------------------------------------------------------------
@@ -211,7 +217,7 @@ def _marker() -> str:
     )
 
 
-def _instruction(usage: float, urgent: bool) -> str:
+def _instruction(usage: float, urgent: bool, prior: Optional[str] = None) -> str:
     pct = int(round(usage * 100))
 
     if urgent:
@@ -237,20 +243,33 @@ def _instruction(usage: float, urgent: bool) -> str:
             "new — then do this before continuing."
         )
 
+    prior_block = ""
+    if prior:
+        prior_block = f"""\n\nYour PREVIOUS handoff (from the last reset) is included below. This new document
+supersedes it — carry forward anything still relevant: the objective, standing
+decisions, unresolved work, blocked items, and still-live traps. Drop only what
+is finished and no longer needed. You are NOT starting from nothing; you are
+updating a prior.\n\n<prior-handoff>\n{prior}\n</prior-handoff>"""
+
+    template_block = f"""
+Write to this EXACT structure — keep every section, even when empty:
+
+{HANDOFF_TEMPLATE}""" if HANDOFF_TEMPLATE else ""
+
     return f"""{head}
 
 {pause}
 
 1. Write a COMPLETE successor handoff. Follow your `writing-a-self-handoff` skill
-   for how to write it well (load it with `skill_view` if it isn't in context).
-   Write for a reader with your capabilities and none of this session's memory:
-   lead with the traps, the current verified state, key files/paths, decisions and
-   dead-ends, ordered next steps, and anything you owe that isn't done.
+   for the craft — lead with the traps, pointer recoverable state, flag judgment
+   calls, name your loose ends — but fit the result to the structure below so
+   it stays consistent across resets.{template_block}{prior_block}
 2. Save it to a markdown file using your file-editing tools.
 3. Call the `finalize_handoff` tool with `confirm: true` and `path:` set to the
    exact file you wrote.
 4. Then stop and end your turn. The session resets into a fresh context seeded
-   with your handoff, and next-you continues from it.
+   with your handoff plus your most recent turns, and next-you continues from
+   there.
 
-This document is the only thing that crosses the reset. Everything you learned
-here that isn't in it is lost."""
+This document is the primary thing that crosses the reset. Everything you
+learned here that isn't in it is lost."""
