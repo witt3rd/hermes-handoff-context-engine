@@ -113,18 +113,29 @@ unfinished work honestly).
 
 ## Getting started
 
-**1. Clone**
+> For a plain install into a Hermes profile, the fastest correct path is the CLI
+> — it clones, pins an immutable commit, and enables in one step. The manual
+> clone + symlink below is the local-development convention.
+
+**1. Install the plugin**
+
+Official (recommended):
+
+```bash
+hermes plugins install witt3rd/hermes-handoff-context-engine --enable
+```
+
+This checks out a pinned commit into `~/.hermes/plugins/handoff/` and adds
+`handoff` to `plugins.enabled`. Update later with `hermes plugins update
+handoff`; remove with `hermes plugins remove handoff`. (For a pinned install,
+pass `--ref <full-40-char-sha>`.)
+
+Local development (house convention — live-edits a checkout):
 
 ```bash
 git clone https://github.com/witt3rd/hermes-handoff-context-engine.git \
     ~/src/ext/hermes-handoff-context-engine
-```
-
-**2. Symlink into your profile's plugins directory**
-
-```bash
-ln -s ~/src/ext/hermes-handoff-context-engine \
-    "$HERMES_HOME/plugins/handoff"
+ln -s ~/src/ext/hermes-handoff-context-engine "$HERMES_HOME/plugins/handoff"
 ```
 
 `HERMES_HOME` is the root of your active Hermes profile — the directory that
@@ -136,16 +147,16 @@ the `writing-a-self-handoff` craft skill is recommended)
 **Copy** these — don't symlink them. Unlike the plugin (code you track
 upstream), skills are starters meant to be *personalized*: your agent will
 refine its own handoff instructions over time, and a symlink would push those
-edits back into the repo (and lose them on `git pull`).
+edits back into the repo (and lose them on update).
 
 ```bash
 # REQUIRED — the manual trigger. /self-handoff resolves to this skill.
-cp -r ~/src/ext/hermes-handoff-context-engine/skills/self-handoff \
+cp -r "$HERMES_HOME/plugins/handoff/skills/self-handoff" \
     "$HERMES_HOME/skills/self-handoff"
 
 # RECOMMENDED — how to write a good handoff. Skip if you maintain your own
 # writing-a-self-handoff skill; yours takes over automatically (resolved by name).
-cp -r ~/src/ext/hermes-handoff-context-engine/skills/writing-a-self-handoff \
+cp -r "$HERMES_HOME/plugins/handoff/skills/writing-a-self-handoff" \
     "$HERMES_HOME/skills/writing-a-self-handoff"
 ```
 

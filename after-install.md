@@ -2,7 +2,10 @@
 
 `hermes plugins install` cloned this plugin and (if you said yes) added it to
 `plugins.enabled`. Two things remain — deliberately, because an installer
-shouldn't make them for you:
+shouldn't make them for you. (For the full walkthrough — install, engine
+selection, skills, restart, verify — see the bundled
+**`install-handoff-engine`** skill at
+`skills/install-handoff-engine/SKILL.md`.)
 
 ## 1. Select the engine
 
@@ -22,7 +25,7 @@ explicitly set a platform's toolset list to empty `[]`).
 Skills are starters your agent personalizes over time, so **copy** them (a
 symlink would push the agent's edits back into the plugin repo and lose them on
 update). From the installed plugin directory
-(`~/.hermes/plugins/hermes-handoff-context-engine/` by default):
+(`~/.hermes/plugins/handoff/` by default):
 
 ```bash
 cp -r ./skills/self-handoff           "$HERMES_HOME/skills/self-handoff"
