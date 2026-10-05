@@ -73,7 +73,18 @@ Every request, deferral, finalize, swap and truncation is appended to
 `$HERMES_HOME/handoffs/events.jsonl` (counts and phases only, never content).
 That file is the place to check whether the engine is working. The engine keeps
 no database: a `handoff_state.db` in a profile is left over from an old version
-and is never updated.
+and is never updated. For a profile named `forge` run from `~/forge/profiles/forge`
+that is `~/forge/profiles/forge/handoffs/events.jsonl`. `handoff_requested` rows
+carry `basis` (`measured` host preflight / `host_estimate` / `estimated`) and, when
+a swap came before in the same session lineage, `seconds_since_swap` — a small
+number there means the reset did not buy room. `handoff_swapped` rows carry
+`tail_tokens`, `tail_dropped` and `seed_tokens`, the real size the new session
+starts at.
+
+The percentage in the injected request is stated as tokens of the model's context
+window (`N tokens … P% of the model's C-token context window`) and says whether
+`N` was measured by the host or is an estimate; a rough estimate never replaces
+the host's measured figure.
 
 Handoff documents are written wherever the agent chooses (it reports the path
 via `finalize_handoff`) and are not deleted, so you also get a durable trail.
@@ -96,6 +107,10 @@ session/compaction.ts`) shape what the successor actually wakes into:
    The most recent raw turns (up to `keep_tokens`, default 8000) survive
    verbatim alongside the authored handoff, so the successor has immediate
    in-flight context (the last tool round, the mid-edit) instead of groping.
+   `keep_tokens` is a hard ceiling measured on everything the provider receives
+   (tool-call arguments, sidecar content — not just `content`); a message that
+   alone exceeds it is dropped, never force-kept. The safety truncation is
+   likewise bounded to 10% of the window.
 
 The handoff is still the *primary* thing that crosses — the layered prior and the
 raw tail are continuity aids on top of it, not replacements.
@@ -218,7 +233,7 @@ context:
 | `context.handoff.soft_ratio` | `0.85` | Where the agent is asked to author its handoff |
 | `context.handoff.urgent_ratio` | = `soft_ratio` | Where the instruction escalates to stop-now |
 | `context.handoff.hard_ratio` | `0.90` | Safety net; lossily truncates if no handoff was produced |
-| `context.handoff.protect_last_n` | `16` | Messages kept if the safety net fires |
+| `context.handoff.protect_last_n` | `16` | Max messages kept if the safety net fires (also bounded to 10% of the window) |
 | `context.handoff.keep_tokens` | `8000` | Most recent raw transcript kept verbatim through a swap (0 = full reset) |
 
 `soft ≤ urgent ≤ hard` is enforced at load. Violations are clamped with a

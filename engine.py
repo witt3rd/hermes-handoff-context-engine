@@ -29,6 +29,7 @@ that call is deferred into a handoff request instead of a truncation (see
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,12 +40,26 @@ from .state import HandoffStore, PHASE_NORMAL, PHASE_AUTHORING, PHASE_READY
 
 logger = logging.getLogger(__name__)
 
+try:
+    from agent.model_metadata import estimate_messages_tokens_rough as _host_estimate
+except Exception:  # pragma: no cover - host helper is optional
+    _host_estimate = None
+
 DEFAULT_SOFT_RATIO = 0.85
 DEFAULT_HARD_RATIO = 0.90
 DEFAULT_PROTECT_LAST_N = 16
 # Recent raw transcript retained verbatim across a handoff swap, so the
 # successor has immediate working context (mirrors opencode's `keep.tokens`).
 DEFAULT_KEEP_TOKENS = 8000
+# Ceiling on the tail the LOSSY safety truncation retains, as a fraction of the
+# window. It is the last line of defence, so it must actually shrink the
+# transcript: 16 retained messages once measured ~1.19M tokens.
+TRUNCATION_TAIL_RATIO = 0.10
+_IMAGE_TOKENS = 1500
+_IMAGE_PARTS = {"image", "image_url", "input_image"}
+# Fields the host never sends to the provider (nor counts), plus our own marker.
+_NOT_SENT = {"_anthropic_content_blocks", "reasoning_details",
+             "_compressed_summary"}
 
 
 def _load_settings() -> Dict[str, Any]:
@@ -100,6 +115,65 @@ HANDOFF_TEMPLATE = """## Objective
 
 ## Relevant Files
 - [file or directory path: why it matters, or "(none)"]"""
+
+
+def _own_message_tokens(msg: Dict[str, Any]) -> int:
+    """Char-based estimate of everything the provider receives for ``msg``.
+
+    The old estimate looked at ``content`` only. The bulk of a message can sit in
+    other fields the host sends and counts — tool_call arguments, the
+    ``api_content`` sidecar that substitutes for ``content``, reasoning — so a
+    tail of "~8,000 tokens" was really most of a million. Mirrors the host's
+    wire shadow: base64 images cost a flat rate instead of their characters.
+    """
+    sidecar = msg.get("api_content")
+    sidecar_wins = (isinstance(sidecar, str) and bool(sidecar)
+                    and msg.get("role") in ("user", "assistant"))
+    images = 0
+    shadow: Dict[str, Any] = {}
+    for key, value in msg.items():
+        if key in _NOT_SENT:
+            continue
+        if key == "api_content":
+            if sidecar_wins:
+                shadow["content"] = value
+            continue
+        if key == "content":
+            if sidecar_wins:
+                continue
+            if isinstance(value, list):
+                cleaned = []
+                for part in value:
+                    if isinstance(part, dict) and part.get("type") in _IMAGE_PARTS:
+                        images += 1
+                    else:
+                        cleaned.append(part)
+                value = cleaned
+        shadow[key] = value
+    try:
+        text = json.dumps(shadow, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(shadow)
+    return max(1, len(text) // 4) + images * _IMAGE_TOKENS
+
+
+def _message_tokens(msg: Dict[str, Any]) -> int:
+    """Conservative size of one message: the larger of our estimate and the host's."""
+    cost = _own_message_tokens(msg)
+    if _host_estimate is not None:
+        try:
+            cost = max(cost, int(_host_estimate([msg])))
+        except Exception:
+            pass
+    return cost
+
+
+def _drop_orphan_tool_results(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop leading tool results whose assistant tool_call was cut away."""
+    i = 0
+    while i < len(msgs) and msgs[i].get("role") == "tool":
+        i += 1
+    return msgs[i:]
 
 
 class HandoffContextEngine(ContextEngine):
@@ -271,6 +345,9 @@ class HandoffContextEngine(ContextEngine):
 
         self.store = HandoffStore()
         self.store.ensure_session(session_id)
+        old_id = kwargs.get("old_session_id")
+        if kwargs.get("boundary_reason") == "compression" and old_id:
+            self.store.inherit(old_id, session_id)
         self.compression_count = self.store.get_swap_count(session_id)
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
@@ -418,7 +495,8 @@ class HandoffContextEngine(ContextEngine):
         return self._safety_truncate(messages, tokens=tokens, caller=caller)
 
     def request_handoff(self, usage: float, source: str, tokens: int = 0,
-                        session_id: Optional[str] = None) -> bool:
+                        session_id: Optional[str] = None,
+                        basis: Optional[str] = None) -> bool:
         """Move the session normal -> authoring; True if newly requested.
 
         Single entry point for every trigger (turn-start hook, should_compress,
@@ -431,7 +509,12 @@ class HandoffContextEngine(ContextEngine):
         phase = self.store.get_phase(sid)
         if phase == PHASE_READY:
             return False
-        self.store.set_usage(sid, usage)
+        if basis is None:
+            basis = {"should_compress": "measured",
+                     "host_compaction": "host_estimate"}.get(source, "estimated")
+        self.store.set_usage(sid, usage, tokens=tokens,
+                             context_length=self.context_length, basis=basis,
+                             soft=self.soft_ratio, hard=self.hard_ratio)
         self.store.set_urgent(sid, usage >= self.urgent_ratio)
         if phase == PHASE_AUTHORING:
             return False
@@ -442,8 +525,18 @@ class HandoffContextEngine(ContextEngine):
             usage * 100, f"{tokens:,}" if tokens else "?",
             f"{self.context_length:,}", sid, source,
         )
+        # A request soon after a swap means the reset did not buy much room (the
+        # Forge chain: handoff 2 only ~15 minutes after handoff 1). Record how
+        # soon so a chain is visible in events.jsonl, not inferred from logs.
+        chain: Dict[str, Any] = {}
+        swaps = self.store.get_swap_count(sid)
+        swapped_at = self.store.get_swapped_at(sid)
+        if swaps and swapped_at:
+            chain = {"swaps_in_lineage": swaps,
+                     "seconds_since_swap": int(time.time() - swapped_at)}
         self.record_event("handoff_requested", source=source, tokens=tokens,
-                          usage=round(usage, 4), session_id=sid)
+                          usage=round(usage, 4), session_id=sid, basis=basis,
+                          **chain)
         return True
 
     def record_event(self, event: str, **fields: Any) -> None:
@@ -483,7 +576,9 @@ class HandoffContextEngine(ContextEngine):
         self.store.set_last_handoff(self.session_id, content)
 
         system_msgs = [m for m in messages if m.get("role") == "system"]
-        tail = self._recent_tail([m for m in messages if m.get("role") != "system"])
+        non_system = [m for m in messages if m.get("role") != "system"]
+        tail = self._recent_tail(non_system)
+        tail_tokens = sum(_message_tokens(m) for m in tail)
 
         handoff_user = {
             "role": "user",
@@ -515,46 +610,56 @@ class HandoffContextEngine(ContextEngine):
         # Reset the machine: back to normal, forget the consumed document.
         self.store.set_phase(self.session_id, PHASE_NORMAL)
         self.store.set_handoff_path(self.session_id, None)
-        self.store.increment_swap_count(self.session_id)
+        self.store.mark_swapped(self.session_id)
         self.compression_count += 1
+        # The size the NEW session starts at, measured on what we return — the
+        # number that decides whether this reset bought any room.
+        seed_tokens = sum(_message_tokens(m) for m in seed if m.get("role") != "system")
         self.record_event("handoff_swapped", messages_in=len(messages),
-                          messages_out=len(seed), handoff_chars=len(content))
+                          messages_out=len(seed), handoff_chars=len(content),
+                          tail_messages=len(tail), tail_tokens=tail_tokens,
+                          tail_dropped=len(non_system) - len(tail),
+                          seed_tokens=seed_tokens)
 
         logger.info(
             "Handoff: swapped %d messages for authored handoff (%d chars) from %s "
-            "keeping %d recent messages (~%s tokens)",
-            len(messages), len(content), path, len(tail),
-            f"{self.keep_tokens:,}" if self.keep_tokens else "none",
+            "keeping %d recent messages (~%s tokens, budget %s); new session "
+            "starts at ~%s tokens excluding system prompt and tools",
+            len(messages), len(content), path, len(tail), f"{tail_tokens:,}",
+            f"{self.keep_tokens:,}", f"{seed_tokens:,}",
         )
         return seed
 
     def _recent_tail(self, non_system: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Keep the most recent messages up to ``keep_tokens`` verbatim.
 
-        Mirrors opencode's `keep.tokens`: the handoff swap no longer discards
-        the entire transcript — the tail's immediate working context (the last
-        tool round, the in-flight edit) crosses the reset raw, so the successor
-        is not groping for where it was. At least one message is always kept,
-        even if a single turn exceeds the budget.
+        Mirrors opencode's `keep.tokens`: the handoff swap does not discard the
+        entire transcript — the tail's immediate working context crosses the
+        reset raw. The budget is a real ceiling: sizes come from
+        ``_message_tokens`` (every field the provider receives, not just
+        ``content``) and a single message over budget is dropped rather than
+        force-kept. The handoff document is what carries state; a tail that
+        restarts the session at or above soft only chains the next handoff.
         """
-        if not self.keep_tokens:
+        return self._bounded_tail(non_system, self.keep_tokens)
+
+    def _bounded_tail(self, non_system: List[Dict[str, Any]], budget: int,
+                      max_messages: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Newest-first walk under a token budget, cut at a clean boundary."""
+        if not budget:
             return []
         total = 0
-        kept = []
+        kept: List[Dict[str, Any]] = []
         for msg in reversed(non_system):
-            cost = self._estimate_tokens(msg)
-            if kept and total + cost > self.keep_tokens:
+            if max_messages is not None and len(kept) >= max_messages:
+                break
+            cost = _message_tokens(msg)
+            if total + cost > budget:
                 break
             kept.append(msg)
             total += cost
         kept.reverse()
-        return kept
-
-    def _estimate_tokens(self, msg: Dict[str, Any]) -> int:
-        """Rough char-based token estimate for a single message dict."""
-        content = msg.get("content")
-        text = content if isinstance(content, str) else json.dumps(content)
-        return max(1, len(text) // 4)
+        return _drop_orphan_tool_results(kept)
 
     def _safety_truncate(
         self,
@@ -565,7 +670,11 @@ class HandoffContextEngine(ContextEngine):
         """Last-resort head/tail keep so the window is never exceeded."""
         system_msgs = [m for m in messages if m.get("role") == "system"]
         non_system = [m for m in messages if m.get("role") != "system"]
-        tail = non_system[-max(1, self.protect_last_n):]
+        # Bound by size as well as count: the last N messages can themselves be
+        # most of a million tokens (Forge: 16 messages -> 17, ~1.19M, no relief).
+        budget = int(self.context_length * TRUNCATION_TAIL_RATIO) or DEFAULT_KEEP_TOKENS * 10
+        tail = self._bounded_tail(non_system, budget,
+                                  max_messages=max(1, self.protect_last_n))
 
         # Say which failure this is. The old note always claimed a handoff
         # "was not completed", which read as an agent that ignored a request
@@ -578,10 +687,14 @@ class HandoffContextEngine(ContextEngine):
         else:
             why = ("The context limit was reached before a handoff was ever "
                    "requested (no handoff instruction reached this session).")
+        oversized = ""
+        if len(tail) < min(len(non_system), max(1, self.protect_last_n)):
+            oversized = (" Some recent messages were too large to keep and were "
+                         "dropped too.")
         note = {
             "role": "user",
             "content": (
-                f"[CONTEXT SAFETY TRUNCATION] {why} Older turns were dropped. If you "
+                f"[CONTEXT SAFETY TRUNCATION] {why} Older turns were dropped.{oversized} If you "
                 "need continuity, write a handoff now and call finalize_handoff."
             ),
             COMPRESSED_SUMMARY_METADATA_KEY: True,
@@ -593,21 +706,24 @@ class HandoffContextEngine(ContextEngine):
         self.compression_count += 1
 
         result = system_msgs + [note] + tail
+        tail_tokens = sum(_message_tokens(m) for m in tail)
         # Loud on purpose: this is the lossy path this plugin exists to avoid.
         # handoff_requested=False means the trigger never fired (look at who
         # called compress, and when); True means the agent did not convert.
         logger.warning(
             "Handoff: LOSSY SAFETY TRUNCATION for %s — %d messages -> %d "
             "(~%s tokens, %s caller, handoff %s). No authored handoff existed; "
-            "context was chopped to the last %d messages.",
+            "context was chopped to the last %d messages, bounded to ~%s tokens "
+            "(kept %d, ~%s tokens).",
             self.session_id, len(messages), len(result),
             f"{tokens:,}" if tokens else "unknown", caller,
             "requested but not finalized" if requested else "NEVER requested",
-            self.protect_last_n,
+            self.protect_last_n, f"{budget:,}", len(tail), f"{tail_tokens:,}",
         )
         self.record_event("lossy_truncation", tokens=tokens, caller=caller,
                           handoff_requested=requested,
-                          messages_in=len(messages), messages_out=len(result))
+                          messages_in=len(messages), messages_out=len(result),
+                          tail_messages=len(tail), tail_tokens=tail_tokens)
         return result
 
     # -- Tool surface: finalize_handoff ------------------------------------
