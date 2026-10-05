@@ -152,9 +152,20 @@ def system_prompt_handler(
         # Keep usage fresh so the injected instruction's urgency tracks reality
         # as the session keeps growing while the agent hasn't handed off yet.
         if phase == PHASE_AUTHORING:
-            live = _estimate_usage(engine, conversation_history)
-            store.set_usage(session_id, live)
-            store.set_urgent(session_id, live >= getattr(engine, "urgent_ratio", URGENT_USAGE))
+            # Refresh ONLY from the host's live preflight figure. This engine
+            # copy is often brand new (the gateway builds an agent per message)
+            # with no preflight yet; falling back to the rough message estimate
+            # here overwrote the request-time figure with a number several times
+            # too low (Forge was told ~6% and ~62% while the log said 85%/86%).
+            preflight = getattr(engine, "last_preflight_tokens", 0) or 0
+            ctx_len = getattr(engine, "context_length", 0) or 0
+            if preflight and ctx_len:
+                live = preflight / ctx_len
+                store.set_usage(session_id, live, tokens=preflight,
+                                context_length=ctx_len, basis="measured",
+                                soft=engine.soft_ratio, hard=engine.hard_ratio)
+                store.set_urgent(session_id,
+                                 live >= getattr(engine, "urgent_ratio", URGENT_USAGE))
             return {"content": _marker()}
         return None
 
@@ -162,9 +173,12 @@ def system_prompt_handler(
     if usage >= engine.soft_ratio:
         # One entry point for every trigger so each request is logged and
         # ledgered identically (engine.request_handoff).
+        preflight = getattr(engine, "last_preflight_tokens", 0) or 0
+        ctx_len = getattr(engine, "context_length", 0) or 0
         engine.request_handoff(usage, "turn_start",
-                               getattr(engine, "last_preflight_tokens", 0) or 0,
-                               session_id=session_id)
+                               preflight or int(usage * ctx_len),
+                               session_id=session_id,
+                               basis="measured" if preflight else "estimated")
         return {"content": _marker()}
 
     return None
@@ -201,7 +215,8 @@ def pre_llm_call_handler(session_id: str = "", **kwargs) -> Optional[Dict[str, A
 
     return {"context": _instruction(store.get_usage(session_id),
                                     store.get_urgent(session_id),
-                                    store.get_last_handoff(session_id))}
+                                    store.get_last_handoff(session_id),
+                                    store.get_usage_detail(session_id))}
 
 
 # -- Text ------------------------------------------------------------------
@@ -216,13 +231,48 @@ def _marker() -> str:
     )
 
 
-def _instruction(usage: float, urgent: bool, prior: Optional[str] = None) -> str:
+def _usage_phrase(usage: float, detail: Optional[Dict[str, Any]] = None) -> str:
+    """Say plainly what the percentage is a percentage OF, and how it was got.
+
+    "~62% of its context window" left an agent unable to tell whether that was
+    tokens, a message count, or a fraction of some threshold. Name the token
+    figure, the window it is measured against, and whether it is a measurement
+    or an estimate.
+    """
     pct = int(round(usage * 100))
+    d = detail or {}
+    tokens = int(d.get("tokens") or 0)
+    ctx = int(d.get("context_length") or 0)
+    if not tokens or not ctx:
+        return f"at ~{pct}% of the model's context window"
+    pct = int(round(tokens / ctx * 100))
+    window = f"{pct}% of the model's {ctx:,}-token context window"
+    if d.get("basis") == "measured":
+        return (f"{tokens:,} tokens (as measured by the host on its latest request) "
+                f"— {window}")
+    who = "the host's" if d.get("basis") == "host_estimate" else "a rough"
+    return (f"an estimated ~{tokens:,} tokens ({who} estimate; the true size may "
+            f"differ) — {window}")
+
+
+def _thresholds_phrase(detail: Optional[Dict[str, Any]]) -> str:
+    d = detail or {}
+    soft, hard = d.get("soft") or 0, d.get("hard") or 0
+    if not soft or not hard:
+        return ""
+    return (f" A handoff is requested at {int(round(soft * 100))}% of the window; "
+            f"the hard safety truncation fires at {int(round(hard * 100))}%.")
+
+
+def _instruction(usage: float, urgent: bool, prior: Optional[str] = None,
+                 detail: Optional[Dict[str, Any]] = None) -> str:
+    phrase = _usage_phrase(usage, detail)
+    limits = _thresholds_phrase(detail)
 
     if urgent:
         head = (
-            f"🛑 STOP — CONTEXT HANDOFF REQUIRED NOW. This session is at ~{pct}% of its "
-            "context window and is within a turn or two of a hard limit. If you hit it, "
+            f"🛑 STOP — CONTEXT HANDOFF REQUIRED NOW. This session's context is {phrase}, "
+            f"and is approaching its hard limit.{limits} If you hit it, "
             "there is no graceful summary: the transcript is chopped to the last handful "
             "of messages and everything else is lost. Do not continue the current task."
         )
@@ -233,8 +283,8 @@ def _instruction(usage: float, urgent: bool, prior: Optional[str] = None) -> str
         )
     else:
         head = (
-            f"⚠️ CONTEXT HANDOFF REQUESTED. This session is at ~{pct}% of its context "
-            "window. Rather than let it drift into a lossy truncation, hand off to a "
+            f"⚠️ CONTEXT HANDOFF REQUESTED. This session's context is {phrase}.{limits} "
+            "Rather than let it drift into a lossy truncation, hand off to a "
             "fresh instance of yourself now."
         )
         pause = (
