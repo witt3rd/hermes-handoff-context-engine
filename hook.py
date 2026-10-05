@@ -20,6 +20,11 @@ So detection and delivery are split:
 
 Ordering is safe: turn_context runs the system_prompt hook before the
 pre_llm_call hook, so detection and delivery happen in the same turn.
+
+Detection also happens in the engine itself: ``should_compress()`` (before
+every API call, mid tool-loop included) and ``compress()`` when gateway session
+hygiene calls it below the hard net. All three go through
+``engine.request_handoff``. Delivery is always this module's pre_llm_call.
 """
 
 import logging
@@ -155,17 +160,11 @@ def system_prompt_handler(
 
     usage = _estimate_usage(engine, conversation_history)
     if usage >= engine.soft_ratio:
-        store.set_phase(session_id, PHASE_AUTHORING)
-        store.set_usage(session_id, usage)
-        store.set_urgent(session_id, usage >= getattr(engine, "urgent_ratio", URGENT_USAGE))
-        logger.info(
-            "Handoff: context at %.0f%% (~%s/%s tokens) for %s — requesting a "
-            "self-handoff (instruction injected into the user turn).",
-            usage * 100,
-            f"{getattr(engine, 'last_preflight_tokens', 0):,}",
-            f"{getattr(engine, 'context_length', 0):,}",
-            session_id,
-        )
+        # One entry point for every trigger so each request is logged and
+        # ledgered identically (engine.request_handoff).
+        engine.request_handoff(usage, "turn_start",
+                               getattr(engine, "last_preflight_tokens", 0) or 0,
+                               session_id=session_id)
         return {"content": _marker()}
 
     return None
