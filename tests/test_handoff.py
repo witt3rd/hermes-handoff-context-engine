@@ -116,6 +116,21 @@ class HandoffTriggerTests(unittest.TestCase):
         self.assertEqual(again, msgs)
         self.assertEqual(self._phase(), state_mod.PHASE_AUTHORING)
 
+    def test_out_of_turn_count_triggered_compaction_below_soft_keeps_transcript_without_request(self):
+        """Hygiene's message-count valve fires at any token level; a 30% session
+        must neither be chopped nor told to hand off early."""
+        e = self._engine()
+        msgs = _history()
+        out = e.compress(msgs, current_tokens=300_000)
+        self.assertEqual(out, msgs)
+        self.assertEqual(self._phase(), state_mod.PHASE_NORMAL)
+        self.assertIsNone(hook_mod.pre_llm_call_handler(session_id=self.sid, user_message="hi"))
+
+    def test_out_of_turn_compaction_with_unknown_size_still_truncates(self):
+        e = self._engine()
+        out = e.compress(_history())
+        self.assertTrue(any("SAFETY TRUNCATION" in str(m.get("content")) for m in out))
+
     # -- the safety net must stay intact ---------------------------------
 
     def test_out_of_turn_compaction_at_hard_still_truncates(self):

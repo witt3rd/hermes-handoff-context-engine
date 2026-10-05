@@ -57,10 +57,23 @@ the shared in-process state.)
 ```
 
 If the agent never hands off and context reaches a **hard** threshold (default
-80%), `compress()` falls back to a plain head/tail truncation so the window is
+90%), `compress()` falls back to a plain head/tail truncation so the window is
 never exceeded and the session never dies. The soft-threshold nudge and the
 hard-threshold safety net both read a **live** token estimate of the
 conversation, not the lagging post-response usage.
+
+Hermes' gateway also compacts on its own: **session hygiene** runs before each
+turn at a hardcoded 85% of the window and calls `compress()` directly. Below the
+hard threshold the engine declines that call (returns the transcript unchanged,
+which Hermes treats as a clean no-op) and requests the handoff instead, so the
+turn that follows gets the instruction. Before this, hygiene pre-empted the soft
+trigger on every crossing, and each one became a lossy truncation.
+
+Every request, deferral, finalize, swap and truncation is appended to
+`$HERMES_HOME/handoffs/events.jsonl` (counts and phases only, never content).
+That file is the place to check whether the engine is working. The engine keeps
+no database: a `handoff_state.db` in a profile is left over from an old version
+and is never updated.
 
 Handoff documents are written wherever the agent chooses (it reports the path
 via `finalize_handoff`) and are not deleted, so you also get a durable trail.
@@ -251,8 +264,11 @@ active session grows ~3.2k tokens/min and a handoff converts in ~90s, so the
 runway needed is small — which is why the default triggers late. The residual
 risk is **burst** (one turn reading several large files can add 100k+ at once),
 which is what the `hard_ratio` margin absorbs. If `LOSSY SAFETY TRUNCATION`
-appears in the log, a burst beat the handoff and these should come down; that log
-line carries the exact token count so the adjustment can be arithmetic.
+appears in the log, check its `handoff` field before you change thresholds.
+`requested but not finalized` means a burst beat the handoff, so these should come
+down. `NEVER requested` means the trigger never ran, so look at the caller and
+`events.jsonl`. The line carries the exact token count, so any adjustment can be
+worked out from it.
 
 Unlike the built-in compressor (and unlike observational-memory's background
 passes), **the handoff engine makes no side-channel LLM calls of its own** — the
@@ -275,6 +291,12 @@ model and full toolset.
   77% is already `normal` with no history. It gets the urgent-tier instruction
   on its next turn, but if it crosses the hard threshold first, it is truncated
   without ever having been asked.
+- **One long turn can still jump from soft to hard.** Detection now runs before
+  every API call (`should_compress()`), but the instruction can only be delivered
+  when a user turn starts (`pre_llm_call`). Hermes has no mid-turn injection
+  channel that is safe for forks, so an autonomous turn that grows past both
+  thresholds in one tool loop is still truncated. The truncation is logged as
+  `handoff requested but not finalized`.
 
 ---
 
