@@ -109,7 +109,8 @@ def _estimate_usage(engine: Any, conversation_history: List[Dict[str, Any]]):
        figure (e.g. the first turn after a restart). It under-counts structured
        tool-result blocks badly: a real 812k-token session estimated under 600k
        here, which is exactly why it is not the primary source.
-    3. ``last_prompt_tokens`` - last resort; lags a full turn behind.
+    Never the engine's bare ``last_prompt_tokens``: it can be a replayed host
+    estimate that nothing corroborated, and it lags a full turn anyway.
     """
     ctx_len = getattr(engine, "context_length", 0) or 0
     if not ctx_len:
@@ -124,9 +125,6 @@ def _estimate_usage(engine: Any, conversation_history: List[Dict[str, Any]]):
             tokens, basis = estimate_messages_tokens_rough(conversation_history), "engine_estimate"
         except Exception:
             tokens = 0
-    if not tokens:
-        tokens = max(0, getattr(engine, "last_prompt_tokens", 0) or 0)
-        basis = "host_estimate" if tokens else None
 
     return tokens / ctx_len, tokens, basis
 

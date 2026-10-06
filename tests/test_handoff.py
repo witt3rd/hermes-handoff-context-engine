@@ -138,9 +138,13 @@ class HandoffTriggerTests(unittest.TestCase):
         self.assertEqual(self._phase(), state_mod.PHASE_NORMAL)
         self.assertIsNone(hook_mod.pre_llm_call_handler(session_id=self.sid, user_message="hi"))
 
-    def test_out_of_turn_compaction_with_unknown_size_still_truncates(self):
+    def test_out_of_turn_compaction_with_unknown_size_goes_by_the_messages(self):
+        """No figure from the host: the messages decide. A tiny history is not
+        chopped; a really huge one still is."""
         e = self._engine()
-        out = e.compress(_history())
+        tiny = _history()
+        self.assertEqual(e.compress(tiny), tiny)
+        out = self._engine().compress(_heavy(1_000_000))
         self.assertTrue(any("SAFETY TRUNCATION" in str(m.get("content")) for m in out))
 
     # -- the safety net must stay intact ---------------------------------
@@ -183,6 +187,7 @@ class HandoffTriggerTests(unittest.TestCase):
         """should_compress() runs before EVERY API call (turn start and mid tool
         loop); the system_prompt hook only at turn start. Detect here too."""
         e = self._engine()
+        e.select_context(_heavy(860_000))
         self.assertFalse(e.should_compress(860_000))
         self.assertEqual(self._phase(), state_mod.PHASE_AUTHORING)
 
@@ -341,8 +346,15 @@ class InstructionTextTests(unittest.TestCase):
     def _deliver(self):
         return hook_mod.pre_llm_call_handler(session_id=self.sid, user_message="hi")["context"]
 
+    def _measured(self, tokens):
+        """An engine copy that has seen messages really measuring ``tokens``
+        (select_context ran), so the host's figure is corroborated."""
+        e = self._engine()
+        e.select_context(_heavy(tokens))
+        return e
+
     def test_text_states_tokens_and_window_plainly(self):
-        self._engine().should_compress(852_535)
+        self._measured(852_535).should_compress(852_535)
         text = self._deliver()
         self.assertIn("852,535", text)
         self.assertIn("1,000,000", text)
@@ -350,7 +362,7 @@ class InstructionTextTests(unittest.TestCase):
         self.assertIn("context window", text)
 
     def test_fresh_engine_copy_cannot_lower_the_request_time_figure(self):
-        self._engine().should_compress(852_535)
+        self._measured(852_535).should_compress(852_535)
         fresh = self._engine()  # next turn's agent: no preflight number yet
         self.assertEqual(fresh.last_preflight_tokens, 0)
         tiny = [{"role": "user", "content": "hi"}]
@@ -360,8 +372,8 @@ class InstructionTextTests(unittest.TestCase):
         self.assertNotRegex(text, r"~\d%\b")
 
     def test_live_preflight_may_raise_the_figure(self):
-        self._engine().should_compress(852_535)
-        fresh = self._engine()
+        self._measured(852_535).should_compress(852_535)
+        fresh = self._measured(880_000)
         fresh.should_compress(880_000)
         hook_mod.system_prompt_handler(_FakeAgent(fresh), self.sid, [])
         self.assertIn("880,000", self._deliver())
@@ -469,15 +481,18 @@ class PhantomEstimateTests(unittest.TestCase):
 
     def test_fresh_copy_phantom_never_truncates_tiny_session(self):
         """Turn prologue on a fresh engine copy: select_context has not run, so
-        should_compress believes the rough figure - compress() must not act."""
+        should_compress cannot confirm the rough figure - it must not act on it,
+        and compress() must not either."""
         e = self._engine()
-        self.assertTrue(e.should_compress(self.PHANTOM))
+        self.assertFalse(e.should_compress(self.PHANTOM))
+        self.assertEqual(self._phase(), state_mod.PHASE_NORMAL)
         msgs = self._tiny()
         out = e.compress(msgs, current_tokens=self.PHANTOM)
         self.assertEqual(out, msgs)
         kinds = self._kinds()
         self.assertNotIn("lossy_truncation", kinds)
         self.assertIn("truncation_skipped_no_relief", kinds)
+        self.assertIn("uncorroborated_estimate_ignored", kinds)
 
     def test_hygiene_replay_of_a_stored_phantom_neither_chops_nor_requests(self):
         e = self._engine()
@@ -571,7 +586,8 @@ class PhantomEstimateTests(unittest.TestCase):
 
     def test_estimate_is_never_labelled_measured(self):
         e = self._engine()
-        e.should_compress(860_000)  # no provider reading, no select_context
+        e.select_context(_heavy(860_000))
+        e.should_compress(860_000)  # no provider reading
         req = [ev for ev in self._events() if ev["event"] == "handoff_requested"][0]
         self.assertNotEqual(req["basis"], "measured")
         self.assertEqual(req["basis"], "host_estimate")
@@ -595,6 +611,135 @@ class PhantomEstimateTests(unittest.TestCase):
         self.assertEqual(ev["reported_tokens"], 950_000)
         self.assertIn("own_tokens", ev)
         self.assertIn("basis", ev)
+
+
+class InTurnPhantomTests(unittest.TestCase):
+    """Forge, 2026-10-05 18:10:51-54, session 20261005_180457_a71b77 (after PR
+    #3): the host again reported ~1,178,153 tokens (host_estimate) for 9-10 tiny
+    messages (~10.7k real). Three should_compress() calls said 'hard threshold
+    reached', three compress() calls declined ('NOT truncating'), and the fourth
+    - an in-turn caller, 20 messages - chopped 3 of them on the phantom
+    ('LOSSY SAFETY TRUNCATION ... ~1,178,343 tokens, handoff NEVER requested').
+
+    The hole: should_compress() on a fresh engine copy (nothing measured) took
+    the host's figure as-is and RECORDED it as last_preflight_tokens; compress()
+    then used that stored figure without corroborating it against the messages;
+    and the no-relief guard only fires when the tail keeps >=90% - a count-capped
+    chop of a small transcript kept 84%.
+    """
+
+    def setUp(self):
+        state_mod._STATE.clear()
+        self.home = Path(tempfile.mkdtemp(prefix="handoff-test-profile-"))
+        self.sid = f"sess-{self._testMethodName}"
+        self.e = engine_mod.HandoffContextEngine()
+        self.e.on_session_start(self.sid, hermes_home=str(self.home))
+        self.e.update_model(model="m", context_length=CTX)
+
+    def _kinds(self):
+        path = self.home / "handoffs" / "events.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(x)["event"] for x in path.read_text().splitlines() if x.strip()]
+
+    @staticmethod
+    def _session(n):
+        """n non-system messages, ~700 tokens each, the first three the
+        heaviest (as in the log: the chopped head was most of the size)."""
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(n):
+            size = 4000 if i < 3 else 2500
+            role = "user" if i % 2 == 0 else "assistant"
+            msgs.append({"role": role, "content": f"m{i} " + "x" * size})
+        return msgs
+
+    def test_exact_log_sequence_never_truncates(self):
+        e = self.e
+        for phantom, n in [(1_178_153, 9), (1_178_343, 10), (1_178_153, 10)]:
+            self.assertFalse(e.should_compress(phantom))
+            msgs = self._session(n)
+            self.assertEqual(e.compress(msgs, current_tokens=phantom), msgs)
+        # the 4th call: in-turn compress with 20 messages (19 non-system)
+        self.assertFalse(e.should_compress(1_178_343))
+        msgs = self._session(19)
+        self.assertEqual(len(msgs), 20)
+        out = e.compress(msgs, current_tokens=0)
+        self.assertEqual(out, msgs, "20 tiny messages must survive a phantom")
+        out = e.compress(msgs, current_tokens=1_178_343)
+        self.assertEqual(out, msgs)
+        self.assertNotIn("lossy_truncation", self._kinds())
+        self.assertEqual(state_mod.HandoffStore().get_phase(self.sid),
+                         state_mod.PHASE_NORMAL)
+        self.assertNotIn("handoff_requested", self._kinds())
+
+    def test_in_turn_compress_corroborates_a_stored_preflight(self):
+        """Even if a phantom reached last_preflight_tokens, compress() judges
+        it against the messages it was handed."""
+        e = self.e
+        e.should_compress(1)  # mark in-turn
+        e.last_preflight_tokens = 1_178_343
+        e.last_preflight_basis = "host_estimate"
+        msgs = self._session(19)
+        self.assertEqual(e.compress(msgs), msgs)
+        self.assertNotIn("lossy_truncation", self._kinds())
+
+    def test_count_capped_chop_of_a_small_transcript_is_skipped(self):
+        """Direct: truncation that only the message-count cap would drive."""
+        e = self.e
+        msgs = self._session(19)
+        out = e._safety_truncate(msgs, tokens=1_178_343, caller="in-turn",
+                                 basis="host_estimate", reported=1_178_343)
+        self.assertEqual(out, msgs)
+
+    def test_small_window_does_not_make_a_discounted_estimate_actionable(self):
+        """On a small window the 3x trust cap itself can exceed the hard net;
+        a discounted figure whose messages+overhead stay below hard is skipped."""
+        e = self.e
+        e.update_model(model="m", context_length=128_000)
+        e.should_compress(1)
+        msgs = _heavy(20_000)
+        self.assertEqual(e.compress(msgs, current_tokens=1_178_343), msgs)
+        self.assertNotIn("lossy_truncation", self._kinds())
+
+    def test_replayed_last_prompt_tokens_is_not_provider_usage(self):
+        e = self.e
+        e.last_prompt_tokens = 1_178_343  # gateway replay on a fresh copy
+        self.assertFalse(e.should_compress())
+        self.assertEqual(state_mod.HandoffStore().get_phase(self.sid),
+                         state_mod.PHASE_NORMAL)
+
+    def test_phantom_on_fresh_copy_does_not_request_a_handoff(self):
+        self.assertFalse(self.e.should_compress(1_178_343))
+        self.assertEqual(state_mod.HandoffStore().get_phase(self.sid),
+                         state_mod.PHASE_NORMAL)
+        self.assertEqual(self.e.last_preflight_tokens, 0)
+        self.assertNotIn("handoff_requested", self._kinds())
+
+    def test_turn_start_hook_does_not_trust_a_replayed_figure(self):
+        self.e.last_prompt_tokens = 1_178_343
+        hook_mod.system_prompt_handler(_FakeAgent(self.e), self.sid, self._session(9))
+        self.assertEqual(state_mod.HandoffStore().get_phase(self.sid),
+                         state_mod.PHASE_NORMAL)
+
+    def test_unusable_ready_handoff_does_not_loop_on_a_small_transcript(self):
+        e = self.e
+        doc = self.home / "h.md"
+        doc.write_text("## Objective\n- go\n")
+        e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(doc)})
+        doc.write_text("")  # vanished/empty by swap time
+        msgs = self._session(9)
+        self.assertEqual(e.compress(msgs, current_tokens=500_000), msgs)
+        self.assertEqual(state_mod.HandoffStore().get_phase(self.sid),
+                         state_mod.PHASE_NORMAL)
+
+    def test_real_size_still_truncates_in_turn_and_is_bounded(self):
+        e = self.e
+        msgs = _heavy(950_000)
+        e.select_context(msgs)
+        self.assertTrue(e.should_compress(950_000))
+        out = e.compress(msgs, current_tokens=950_000)
+        self.assertTrue(any("SAFETY TRUNCATION" in str(m.get("content")) for m in out))
+        self.assertLessEqual(_tokens(out), CTX * 0.10 + 5_000)
 
 
 class SessionRotationTests(unittest.TestCase):
