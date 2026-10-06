@@ -828,3 +828,39 @@ class EstimateOnlyClimbTests(unittest.TestCase):
         e.select_context(msgs)
         self.assertEqual(e.compress(msgs, current_tokens=int(CTX * 0.87)), msgs)
         self.assertEqual(state_mod.HandoffStore().get_phase(self.sid), state_mod.PHASE_AUTHORING)
+
+
+class ProviderReadingSurvivesEngineCopiesTests(EstimateOnlyClimbTests):
+    """The gateway builds a new engine per message. The provider's last prompt
+    size must outlive the copy, or every message falls back to the host's rough
+    estimate (Augur 2026-10-06: provider said ~289K, the estimate said ~138K)."""
+
+    def test_fresh_copy_is_anchored_on_the_previous_provider_reading(self):
+        first = self._engine()
+        msgs = _heavy(100_000)
+        first.select_context(msgs)
+        first.update_from_response({"prompt_tokens": 289_000})
+        second = self._engine()  # next message: brand-new copy, same session
+        tokens, basis = second.current_pressure()
+        self.assertEqual((tokens, basis), (289_000, engine_mod.BASIS_PROVIDER))
+        # and the host's lower rough estimate no longer decides
+        hist = _heavy(100_000)
+        _, t, b = hook_mod._estimate_usage(second, hist)
+        self.assertEqual((t, b), (289_000, engine_mod.BASIS_PROVIDER))
+
+    def test_provider_reading_near_soft_requests_handoff_even_when_estimate_says_half(self):
+        first = self._engine()
+        first.select_context(_heavy(100_000))
+        first.update_from_response({"prompt_tokens": int(CTX * 0.86)})
+        second = self._engine()
+        msgs = _heavy(100_000)
+        second.select_context(msgs)
+        second.should_compress(int(CTX * 0.43))  # host's rough number: under half
+        self.assertEqual(state_mod.HandoffStore().get_phase(self.sid), state_mod.PHASE_AUTHORING)
+
+    def test_rotation_forgets_the_reading(self):
+        first = self._engine()
+        first.update_from_response({"prompt_tokens": 500_000})
+        first._forget_size_readings()
+        self.assertIsNone(state_mod.HandoffStore().get_real_reading(self.sid))
+        self.assertIsNone(self._engine().current_pressure())
