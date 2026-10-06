@@ -177,6 +177,22 @@ class HandoffStore:
                     new[key] = old[key]
             new["swap_count"] = max(new["swap_count"], old["swap_count"])
 
+    def set_real_reading(self, session_id: str, prompt_tokens: int, own_tokens: int) -> None:
+        """Remember the provider's last prompt size for this session, paired with
+        our own size of the same request. The gateway builds a fresh engine per
+        message, so without this every message starts blind and falls back to the
+        host's rough estimate (which under-counted Augur's 289K session as 138K)."""
+        with _LOCK:
+            _entry(session_id)["real_reading"] = (int(prompt_tokens), int(own_tokens))
+
+    def get_real_reading(self, session_id: str):
+        with _LOCK:
+            return _entry(session_id).get("real_reading")
+
+    def clear_real_reading(self, session_id: str) -> None:
+        with _LOCK:
+            _entry(session_id).pop("real_reading", None)
+
     def reset(self, session_id: str) -> None:
         with _LOCK:
             _STATE[session_id] = {

@@ -418,6 +418,12 @@ class HandoffContextEngine(ContextEngine):
         if kwargs.get("boundary_reason") == "compression" and old_id:
             self.store.inherit(old_id, session_id)
         self.compression_count = self.store.get_swap_count(session_id)
+        # A fresh engine copy per message: pick up the last provider reading for
+        # this session so pressure is anchored on a measurement, not a guess.
+        reading = self.store.get_real_reading(session_id)
+        if reading and reading[0] > 0:
+            self.last_real_prompt_tokens, self._own_at_real = reading
+            self.awaiting_real_usage = False
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         self.session_id = None
@@ -455,6 +461,8 @@ class HandoffContextEngine(ContextEngine):
             self.last_real_prompt_tokens = prompt
             self._own_at_real = self._own_request_tokens
             self.awaiting_real_usage = False
+            if self.store and self.session_id:
+                self.store.set_real_reading(self.session_id, prompt, self._own_request_tokens)
             self.last_preflight_tokens = prompt
             self.last_preflight_basis = BASIS_PROVIDER
 
@@ -482,6 +490,8 @@ class HandoffContextEngine(ContextEngine):
         """Drop every size figure that described the pre-rotation transcript."""
         self.last_real_prompt_tokens = 0
         self.awaiting_real_usage = True
+        if self.store and self.session_id:
+            self.store.clear_real_reading(self.session_id)
         self.last_preflight_tokens = 0
         self.last_preflight_basis = None
         self.last_rough_request_tokens = 0
