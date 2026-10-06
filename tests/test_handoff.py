@@ -795,3 +795,36 @@ class SessionRotationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EstimateOnlyClimbTests(unittest.TestCase):
+    """Augur's sequence: a fresh engine copy per message, never any provider
+    usage, only the host's estimate. Below soft nothing fires and nothing is
+    truncated; once the messages really measure past soft the handoff is
+    requested from our own count."""
+
+    def setUp(self):
+        state_mod._STATE.clear()
+        self.home = Path(tempfile.mkdtemp(prefix="handoff-test-profile-"))
+        self.sid = f"sess-{self._testMethodName}"
+
+    def _engine(self):
+        e = engine_mod.HandoffContextEngine()
+        e.on_session_start(self.sid, hermes_home=str(self.home))
+        e.update_model(model="m", context_length=CTX)
+        return e
+
+    def test_estimate_only_climb_stays_quiet_below_soft_then_requests_at_soft(self):
+        for tokens in (107_000, 127_000, 400_000):
+            e = self._engine()
+            e.note_request_rough_estimate(tokens)
+            msgs = _heavy(tokens)
+            e.select_context(msgs)
+            e.last_prompt_tokens = tokens
+            self.assertEqual(e.compress(msgs, current_tokens=tokens), msgs)
+            self.assertEqual(state_mod.HandoffStore().get_phase(self.sid), state_mod.PHASE_NORMAL)
+        e = self._engine()
+        msgs = _heavy(int(CTX * 0.87))
+        e.select_context(msgs)
+        self.assertEqual(e.compress(msgs, current_tokens=int(CTX * 0.87)), msgs)
+        self.assertEqual(state_mod.HandoffStore().get_phase(self.sid), state_mod.PHASE_AUTHORING)
