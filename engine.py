@@ -55,6 +55,23 @@ DEFAULT_KEEP_TOKENS = 8000
 # window. It is the last line of defence, so it must actually shrink the
 # transcript: 16 retained messages once measured ~1.19M tokens.
 TRUNCATION_TAIL_RATIO = 0.10
+# How far the host's ROUGH pre-send request estimate may exceed what the
+# messages themselves measure (system prompt + tool schemas + known noise) before
+# we stop believing it. The host documents 2-3x over-counts on heavy sessions;
+# Forge (2026-10-05) saw ~17x: a 1.18M "request" whose 15 messages measured ~10k
+# and whose real provider count was 69k. Past this factor the figure is treated
+# as noise, never as context pressure: chopping messages cannot remove a phantom.
+ROUGH_TRUST_FACTOR = 3
+# Fixed per-request overhead (system prompt + tool schemas) assumed when no
+# provider-reported reading has yet revealed the real one. The host's own
+# comment puts 50+ tools at 20-30K; this leaves room for a fat system prompt.
+ASSUMED_OVERHEAD_TOKENS = 60_000
+# A truncation that keeps at least this fraction of the transcript's size is not
+# relief, it is a rotation: it renames the session and frees nothing.
+NO_RELIEF_KEPT_FRACTION = 0.9
+BASIS_PROVIDER = "provider_reported"   # the API's own prompt_tokens (real)
+BASIS_HOST_ESTIMATE = "host_estimate"   # the host's rough / stored figure
+BASIS_ENGINE_ESTIMATE = "engine_estimate"  # our own char-based estimate
 _IMAGE_TOKENS = 1500
 _IMAGE_PARTS = {"image", "image_url", "input_image"}
 # Fields the host never sends to the provider (nor counts), plus our own marker.
@@ -168,6 +185,11 @@ def _message_tokens(msg: Dict[str, Any]) -> int:
     return cost
 
 
+def _request_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Our own conservative size of an entire message list (system prompt included)."""
+    return sum(_message_tokens(m) for m in messages if isinstance(m, dict))
+
+
 def _drop_orphan_tool_results(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Drop leading tool results whose assistant tool_call was cut away."""
     i = 0
@@ -183,21 +205,34 @@ class HandoffContextEngine(ContextEngine):
         self._name = "handoff"
 
         # -- Token state read directly by run_agent.py (ABC contract) --------
-        self.last_prompt_tokens = 0
+        self._last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.threshold_tokens = 0
         self.context_length = 0
         self.compression_count = 0
 
-        # The AUTHORITATIVE live request size, captured from the preflight
-        # number the host passes to should_compress(). This is the same figure
-        # Hermes uses for its own "Pre-API compression: ~N tokens >= threshold"
-        # decision, so it is exact where our own estimates are not:
-        # last_prompt_tokens lags a turn, and estimate_messages_tokens_rough()
-        # badly under-counts structured tool-result blocks. The soft-threshold
-        # nudge (hook.py) reads THIS.
+        # Provenance bookkeeping. The host hands us numbers of THREE different
+        # kinds through one channel and never says which is which:
+        #   * the provider's own prompt_tokens (update_from_response) - real;
+        #   * a ROUGH pre-send request estimate (should_compress(prompt_tokens)
+        #     at turn start / pre-API) - an estimate that can be many times the
+        #     truth, and which the host writes into last_prompt_tokens too;
+        #   * the gateway's stored last_prompt_tokens (hygiene, "actual") - a
+        #     replay of whichever of the above it saw last.
+        # The old engine called all of them "measured". Now only the first is.
+        self.last_real_prompt_tokens = 0   # provider-reported, since last rotation
+        self.awaiting_real_usage = False   # rotated; no provider reading yet
+        self.last_rough_request_tokens = 0  # host's rough estimate of the last request
+        self._own_request_tokens = 0       # our size of the last request (select_context)
+        self._own_at_real = 0              # ... when the last real reading arrived
+        self._deferral_logged = False
+
+        # The live request-size figure the soft-threshold nudge (hook.py) reads,
+        # AFTER corroboration: provider-reported where we have it, otherwise the
+        # host's estimate capped by what the messages themselves measure.
         self.last_preflight_tokens = 0
+        self.last_preflight_basis: Optional[str] = None
 
         # True once the host has consulted should_compress() on THIS engine copy.
         # The host runs should_compress() before every API call of a turn, so a
@@ -249,6 +284,7 @@ class HandoffContextEngine(ContextEngine):
 
         # Apply config overrides last so they win over every default above.
         self._apply_settings()
+        self._guard_ready = True
 
         # -- Session-scoped resources ---------------------------------------
         self.store: Optional[HandoffStore] = None
@@ -259,6 +295,38 @@ class HandoffContextEngine(ContextEngine):
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def last_prompt_tokens(self) -> int:
+        return self._last_prompt_tokens
+
+    @last_prompt_tokens.setter
+    def last_prompt_tokens(self, value: Any) -> None:
+        """Accept host writes, but never let an estimate pose as provider usage.
+
+        The host's turn prologue writes its ROUGH preflight estimate into
+        ``last_prompt_tokens`` (turn_context.py), and the gateway persists that
+        field as the session's "actual" prompt size, which hygiene replays at
+        the next message. A phantom 1.2M estimate therefore became a stored
+        "actual" 854k and fed every later decision. Provider readings arrive
+        through ``update_from_response`` (which writes the backing field
+        directly); a positive write that corroboration would discount is ours
+        to refuse. 0 and -1 (the host's "compression just ran" sentinel) always
+        pass.
+        """
+        try:
+            v = int(value or 0)
+        except (TypeError, ValueError):
+            v = 0
+        if v > 0 and getattr(self, "_guard_ready", False):
+            if self._pressure(v)[0] < v:
+                logger.info(
+                    "Handoff: ignoring host write last_prompt_tokens=%s - not "
+                    "provider-reported and not corroborated by the messages.",
+                    f"{v:,}",
+                )
+                return
+        self._last_prompt_tokens = v
 
     # -- Settings ----------------------------------------------------------
 
@@ -356,7 +424,8 @@ class HandoffContextEngine(ContextEngine):
     def on_session_reset(self) -> None:
         if self.store and self.session_id:
             self.store.reset(self.session_id)
-        self.last_prompt_tokens = 0
+        self._forget_size_readings()
+        self._last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.compression_count = 0
@@ -374,9 +443,133 @@ class HandoffContextEngine(ContextEngine):
         self.threshold_tokens = int(self.context_length * self.hard_ratio)
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        self._last_prompt_tokens = prompt
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", 0)
+        if prompt > 0:
+            # The only provider-reported number this engine ever sees. Pair it
+            # with our own size of the request that produced it, so later
+            # growth is projected from a real anchor (see _pressure).
+            self.last_real_prompt_tokens = prompt
+            self._own_at_real = self._own_request_tokens
+            self.awaiting_real_usage = False
+            self.last_preflight_tokens = prompt
+            self.last_preflight_basis = BASIS_PROVIDER
+
+    def note_request_rough_estimate(self, rough_tokens: int) -> None:
+        """Host's rough estimate of the request about to be sent. Diagnostic only."""
+        try:
+            self.last_rough_request_tokens = max(0, int(rough_tokens))
+        except (TypeError, ValueError):
+            self.last_rough_request_tokens = 0
+
+    def select_context(self, request_messages, **kwargs):
+        """Observe the assembled request; never replace it.
+
+        Runs before every provider call, before the host's pre-API pressure
+        check, so it is where we learn what the messages themselves measure -
+        the yardstick that exposes an inflated rough estimate.
+        """
+        try:
+            self._own_request_tokens = _request_tokens(request_messages or [])
+        except Exception:
+            self._own_request_tokens = 0
+        return None
+
+    def _forget_size_readings(self) -> None:
+        """Drop every size figure that described the pre-rotation transcript."""
+        self.last_real_prompt_tokens = 0
+        self.awaiting_real_usage = True
+        self.last_preflight_tokens = 0
+        self.last_preflight_basis = None
+        self.last_rough_request_tokens = 0
+        self._own_request_tokens = 0
+        self._own_at_real = 0
+        self._deferral_logged = False
+        # Same sentinel the host parks after its own compaction: "no real
+        # usage yet". Never leave the pre-swap figure for the gateway to
+        # persist as the session's "actual" size.
+        self._last_prompt_tokens = -1
+
+    def _pressure(self, reported: int = 0, messages: Optional[List[Dict[str, Any]]] = None):
+        """``(tokens, basis)``: the context size to act on, and where it came from.
+
+        ``reported`` is whatever the host passed (rough preflight estimate, or
+        the provider's figure echoed back); ``messages`` the transcript when we
+        hold it. In order of trust:
+
+        1. A provider-reported reading since the last rotation, plus growth
+           measured by our own estimate since that reading. (Mirrors the host's
+           ``should_defer_preflight_to_real_usage``: real usage beats a rough
+           estimate that is "2-3x real" on heavy sessions.)
+        2. The host's figure, capped at ``ROUGH_TRUST_FACTOR`` x what the
+           messages themselves measure plus fixed overhead. Truncating or
+           handing off removes messages only; a figure the messages cannot
+           account for is not pressure this engine can relieve.
+        3. The host's figure as-is when we cannot measure the messages.
+        """
+        reported = int(reported or 0)
+        own = _request_tokens(messages) if messages else self._own_request_tokens
+
+        real = self.last_real_prompt_tokens
+        if real > 0 and not self.awaiting_real_usage:
+            if reported == real:
+                return real, BASIS_PROVIDER
+            growth = max(0, own - self._own_at_real) if (own and self._own_at_real) else 0
+            return real + growth, BASIS_PROVIDER
+
+        if not reported:
+            return 0, None
+        if own:
+            overhead = (max(0, self.last_real_prompt_tokens - self._own_at_real)
+                        if self.last_real_prompt_tokens and self._own_at_real
+                        else ASSUMED_OVERHEAD_TOKENS)
+            cap = ROUGH_TRUST_FACTOR * (own + overhead)
+            if reported > cap:
+                return cap, BASIS_ENGINE_ESTIMATE
+        return reported, BASIS_HOST_ESTIMATE
+
+    def current_pressure(self):
+        """Best current ``(tokens, basis)`` without a fresh host figure, or None."""
+        real = self.last_real_prompt_tokens
+        if real > 0 and not self.awaiting_real_usage:
+            return self._pressure(real)
+        if self.last_preflight_tokens:
+            return self.last_preflight_tokens, (self.last_preflight_basis
+                                                or BASIS_HOST_ESTIMATE)
+        return None
+
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+        """Tell the host to trust our corroborated figure over its rough one.
+
+        Without this the base class answers False, the host believes its rough
+        estimate, calls should_compress() with it, and on a fresh engine copy
+        (no select_context yet) that was ~1.18M "tokens" against a real 69k:
+        a lossy truncation on every message. Deferral is declined once the
+        corroborated figure reaches soft, so the soft trigger still runs.
+        """
+        if not rough_tokens or not self.context_length:
+            return False
+        if rough_tokens < self.context_length * self.hard_ratio:
+            return False
+        tokens, _ = self._pressure(rough_tokens)
+        if tokens >= self.context_length * self.soft_ratio:
+            return False
+        if not self._deferral_logged:
+            self._deferral_logged = True
+            logger.warning(
+                "Handoff: host's rough estimate ~%s is not corroborated "
+                "(%s: ~%s; messages measure ~%s) - deferring to that instead.",
+                f"{int(rough_tokens):,}", self._pressure(rough_tokens)[1],
+                f"{int(tokens):,}", f"{self._own_request_tokens:,}",
+            )
+            self.record_event("preflight_deferred_to_real_usage",
+                              reported_tokens=int(rough_tokens), tokens=int(tokens),
+                              basis=self._pressure(rough_tokens)[1],
+                              real_prompt_tokens=self.last_real_prompt_tokens,
+                              own_tokens=self._own_request_tokens)
+        return True
 
     # -- Compaction trigger ------------------------------------------------
 
@@ -387,14 +580,16 @@ class HandoffContextEngine(ContextEngine):
         directive lives in the system prompt (hook.py), not here, so the agent
         keeps its full transcript and tools until it finalizes.
         """
-        # Capture the host's authoritative live request size before anything
-        # else — the soft-threshold nudge in hook.py depends on it, and this is
-        # the only place Hermes hands it to us. Record it even when we go on to
-        # return False (the common case, which is exactly when the nudge needs
-        # a fresh number).
+        # Record what the host handed us before anything else - the soft nudge
+        # in hook.py depends on a fresh number, even when we return False. But
+        # corroborate it first: this argument is a ROUGH preflight estimate on
+        # some calls and the provider's real count on others, and only the
+        # latter is ever "measured" (see _pressure).
         self._host_consulted = True
+        tokens, basis = self._pressure(prompt_tokens)
         if prompt_tokens:
-            self.last_preflight_tokens = prompt_tokens
+            self.last_preflight_tokens = tokens
+            self.last_preflight_basis = basis
 
         if not self.store or not self.session_id:
             return False
@@ -403,11 +598,14 @@ class HandoffContextEngine(ContextEngine):
         if phase == PHASE_READY:
             return True
 
-        tokens = prompt_tokens or self.last_prompt_tokens
+        if not tokens:
+            tokens, basis = self.last_prompt_tokens, BASIS_PROVIDER
+            tokens = max(0, tokens)
         if tokens and self.context_length and tokens >= self.context_length * self.hard_ratio:
             logger.warning(
                 "Handoff: hard threshold reached in phase '%s' without a ready "
-                "handoff; safety fallback will truncate.", phase,
+                "handoff (%s tokens, %s); safety fallback will truncate.",
+                phase, f"{tokens:,}", basis,
             )
             return True
 
@@ -417,10 +615,12 @@ class HandoffContextEngine(ContextEngine):
         # the moment it happens. Delivery still waits for the next turn's
         # pre_llm_call (no fork-safe mid-turn injection channel exists yet).
         # Background-review forks run with compression disabled, so the host
-        # never calls this on a fork — its context cannot trip the parent.
+        # never calls this on a fork - its context cannot trip the parent.
         if (phase == PHASE_NORMAL and tokens and tokens > 0 and self.context_length
                 and tokens >= self.context_length * self.soft_ratio):
-            self.request_handoff(tokens / self.context_length, "should_compress", tokens)
+            self.request_handoff(tokens / self.context_length, "should_compress",
+                                 tokens, basis=basis,
+                                 reported=int(prompt_tokens or 0))
         return False
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
@@ -467,7 +667,11 @@ class HandoffContextEngine(ContextEngine):
             # Authored file missing/empty — fall through to safety truncation.
             logger.warning("Handoff: phase 'ready' but document unusable; truncating")
 
-        tokens = current_tokens or self.last_preflight_tokens or max(0, self.last_prompt_tokens)
+        reported = int(current_tokens or 0)
+        tokens, basis = self._pressure(reported, messages)
+        if not tokens:
+            tokens = self.last_preflight_tokens or max(0, self.last_prompt_tokens)
+            basis = self.last_preflight_basis or BASIS_HOST_ESTIMATE
         caller = "in-turn" if self._host_consulted else ("manual" if force else "out-of-turn")
         if (caller == "out-of-turn" and phase != PHASE_READY and tokens
                 and self.context_length
@@ -478,7 +682,8 @@ class HandoffContextEngine(ContextEngine):
             # is reached — firing early costs the whole live context.
             usage = tokens / self.context_length
             if usage >= self.soft_ratio:
-                self.request_handoff(usage, "host_compaction", tokens)
+                self.request_handoff(usage, "host_compaction", tokens,
+                                     basis=basis, reported=reported)
             requested = self.store.get_phase(self.session_id) == PHASE_AUTHORING
             logger.warning(
                 "Handoff: deferred host compaction at %.0f%% (~%s/%s tokens) for %s "
@@ -488,15 +693,18 @@ class HandoffContextEngine(ContextEngine):
                 " and a self-handoff is requested" if requested else "",
             )
             self.record_event("host_compaction_deferred", tokens=tokens,
-                              usage=round(usage, 4), phase=phase,
+                              usage=round(usage, 4), phase=phase, basis=basis,
+                              reported_tokens=reported,
                               handoff_requested=requested)
             return messages
 
-        return self._safety_truncate(messages, tokens=tokens, caller=caller)
+        return self._safety_truncate(messages, tokens=tokens, caller=caller,
+                                     basis=basis, reported=reported)
 
     def request_handoff(self, usage: float, source: str, tokens: int = 0,
                         session_id: Optional[str] = None,
-                        basis: Optional[str] = None) -> bool:
+                        basis: Optional[str] = None,
+                        reported: int = 0) -> bool:
         """Move the session normal -> authoring; True if newly requested.
 
         Single entry point for every trigger (turn-start hook, should_compress,
@@ -510,11 +718,12 @@ class HandoffContextEngine(ContextEngine):
         if phase == PHASE_READY:
             return False
         if basis is None:
-            basis = {"should_compress": "measured",
-                     "host_compaction": "host_estimate"}.get(source, "estimated")
+            basis = {"host_compaction": BASIS_HOST_ESTIMATE}.get(
+                source, BASIS_ENGINE_ESTIMATE)
         self.store.set_usage(sid, usage, tokens=tokens,
                              context_length=self.context_length, basis=basis,
-                             soft=self.soft_ratio, hard=self.hard_ratio)
+                             soft=self.soft_ratio, hard=self.hard_ratio,
+                             reported=reported)
         self.store.set_urgent(sid, usage >= self.urgent_ratio)
         if phase == PHASE_AUTHORING:
             return False
@@ -536,7 +745,9 @@ class HandoffContextEngine(ContextEngine):
                      "seconds_since_swap": int(time.time() - swapped_at)}
         self.record_event("handoff_requested", source=source, tokens=tokens,
                           usage=round(usage, 4), session_id=sid, basis=basis,
-                          **chain)
+                          reported_tokens=int(reported or 0),
+                          real_prompt_tokens=self.last_real_prompt_tokens,
+                          own_tokens=self._own_request_tokens, **chain)
         return True
 
     def record_event(self, event: str, **fields: Any) -> None:
@@ -612,6 +823,7 @@ class HandoffContextEngine(ContextEngine):
         self.store.set_handoff_path(self.session_id, None)
         self.store.mark_swapped(self.session_id)
         self.compression_count += 1
+        self._forget_size_readings()
         # The size the NEW session starts at, measured on what we return — the
         # number that decides whether this reset bought any room.
         seed_tokens = sum(_message_tokens(m) for m in seed if m.get("role") != "system")
@@ -666,6 +878,8 @@ class HandoffContextEngine(ContextEngine):
         messages: List[Dict[str, Any]],
         tokens: int = 0,
         caller: str = "in-turn",
+        basis: Optional[str] = None,
+        reported: int = 0,
     ) -> List[Dict[str, Any]]:
         """Last-resort head/tail keep so the window is never exceeded."""
         system_msgs = [m for m in messages if m.get("role") == "system"]
@@ -675,6 +889,31 @@ class HandoffContextEngine(ContextEngine):
         budget = int(self.context_length * TRUNCATION_TAIL_RATIO) or DEFAULT_KEEP_TOKENS * 10
         tail = self._bounded_tail(non_system, budget,
                                   max_messages=max(1, self.protect_last_n))
+
+        # A truncation that keeps (nearly) everything is a rotation, not relief:
+        # it mints a new session id, frees nothing, and the next message does it
+        # again. Forge, 2026-10-05: 16->17, 18->17, 17->17 messages, a session
+        # rotated every few seconds on a phantom ~1.18M figure (the messages
+        # measured ~10k) until the gateway lost track of the live id and
+        # "session storage could not be written". Where the messages are
+        # already within the retained budget there is nothing to chop - leave
+        # the transcript alone and say so.
+        total_tokens = sum(_message_tokens(m) for m in non_system)
+        kept_tokens = sum(_message_tokens(m) for m in tail)
+        if total_tokens and kept_tokens >= total_tokens * NO_RELIEF_KEPT_FRACTION:
+            logger.warning(
+                "Handoff: NOT truncating %s - %d messages measure ~%s tokens "
+                "and the truncation would keep ~%s of them; the host's figure "
+                "(~%s, %s) is not something chopping messages can relieve.",
+                self.session_id, len(messages), f"{total_tokens:,}",
+                f"{kept_tokens:,}", f"{tokens:,}" if tokens else "unknown",
+                basis or "unknown",
+            )
+            self.record_event("truncation_skipped_no_relief", tokens=tokens,
+                              caller=caller, basis=basis,
+                              reported_tokens=reported, own_tokens=total_tokens,
+                              kept_tokens=kept_tokens, messages_in=len(messages))
+            return messages
 
         # Say which failure this is. The old note always claimed a handoff
         # "was not completed", which read as an agent that ignored a request
@@ -704,6 +943,7 @@ class HandoffContextEngine(ContextEngine):
         self.store.set_phase(self.session_id, PHASE_NORMAL)
         self.store.set_handoff_path(self.session_id, None)
         self.compression_count += 1
+        self._forget_size_readings()
 
         result = system_msgs + [note] + tail
         tail_tokens = sum(_message_tokens(m) for m in tail)
@@ -721,6 +961,8 @@ class HandoffContextEngine(ContextEngine):
             self.protect_last_n, f"{budget:,}", len(tail), f"{tail_tokens:,}",
         )
         self.record_event("lossy_truncation", tokens=tokens, caller=caller,
+                          basis=basis, reported_tokens=reported,
+                          own_tokens=total_tokens,
                           handoff_requested=requested,
                           messages_in=len(messages), messages_out=len(result),
                           tail_messages=len(tail), tail_tokens=tail_tokens)

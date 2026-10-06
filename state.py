@@ -76,24 +76,30 @@ class HandoffStore:
 
     def set_usage(self, session_id: str, usage: float, tokens: int = 0,
                   context_length: int = 0, basis: Optional[str] = None,
-                  soft: float = 0.0, hard: float = 0.0) -> None:
+                  soft: float = 0.0, hard: float = 0.0,
+                  reported: int = 0) -> None:
         """Record how full the context is, and where that number came from.
 
-        ``basis`` is ``"measured"`` (the host's own preflight request size),
-        ``"host_estimate"`` (the host's session-size estimate, passed to
-        compress()) or ``"estimated"`` (our rough fallback). A measured figure is
-        never displaced by a non-measured one: the instruction text must not
-        quietly swap the host's number for a cruder, usually lower, estimate.
+        ``basis`` is ``"provider_reported"`` (the API's own prompt_tokens -
+        the only truly measured figure), ``"host_estimate"`` (a rough or stored
+        figure from the host: preflight estimate, gateway hygiene) or
+        ``"engine_estimate"`` (ours, or the host's figure capped by what the
+        messages measure). ``reported`` is the host's raw figure when it
+        differs, so the text can show both. A provider-reported figure is never
+        displaced by an estimate: the instruction text must not quietly swap the
+        real number for a cruder one.
         """
         with _LOCK:
             e = _entry(session_id)
             old = e.get("usage_detail")
-            if old and old.get("basis") == "measured" and basis != "measured":
+            if (old and old.get("basis") == "provider_reported"
+                    and basis != "provider_reported"):
                 return
             e["usage"] = usage
             e["usage_detail"] = {"tokens": int(tokens or 0),
                                  "context_length": int(context_length or 0),
-                                 "basis": basis, "soft": soft, "hard": hard}
+                                 "basis": basis, "soft": soft, "hard": hard,
+                                 "reported": int(reported or 0)}
 
     def get_usage_detail(self, session_id: str) -> dict:
         """``{usage, tokens, context_length, basis, soft, hard}`` for the text."""

@@ -75,16 +75,20 @@ That file is the place to check whether the engine is working. The engine keeps
 no database: a `handoff_state.db` in a profile is left over from an old version
 and is never updated. For a profile named `forge` run from `~/forge/profiles/forge`
 that is `~/forge/profiles/forge/handoffs/events.jsonl`. `handoff_requested` rows
-carry `basis` (`measured` host preflight / `host_estimate` / `estimated`) and, when
-a swap came before in the same session lineage, `seconds_since_swap` — a small
+carry `basis` (`provider_reported` — the API's own prompt-token count, the only
+real measurement / `host_estimate` — the host's rough or stored figure /
+`engine_estimate` — ours, or the host's figure capped by what the messages measure),
+`reported_tokens` (the host's raw figure when it differs), `real_prompt_tokens` and
+`own_tokens`, and, when a swap came before in the same session lineage, `seconds_since_swap` — a small
 number there means the reset did not buy room. `handoff_swapped` rows carry
 `tail_tokens`, `tail_dropped` and `seed_tokens`, the real size the new session
 starts at.
 
 The percentage in the injected request is stated as tokens of the model's context
 window (`N tokens … P% of the model's C-token context window`) and says whether
-`N` was measured by the host or is an estimate; a rough estimate never replaces
-the host's measured figure.
+`N` is the provider's own count or an estimate; when the host's raw pre-send
+estimate was discounted, both numbers are shown. An estimate never replaces a
+provider-reported figure.
 
 Handoff documents are written wherever the agent chooses (it reports the path
 via `finalize_handoff`) and are not deleted, so you also get a durable trail.
@@ -266,12 +270,22 @@ compaction at all."
 
 ### Choosing thresholds
 
-Both are measured against the **authoritative** live request size — the preflight
-token count Hermes itself uses — captured in `should_compress()`. Earlier versions
-estimated locally and under-counted structured tool-result blocks badly enough
-that the soft threshold never tripped (a real 812k-token session estimated under
-600k), so sessions silently took the lossy truncation instead of handing off.
-Don't reintroduce a local estimate as the primary source.
+Both are measured against the best figure the engine has, in order: the provider's
+own `prompt_tokens` (via `update_from_response`) plus growth since; else the host's
+preflight number passed to `should_compress()`, **corroborated** against what the
+messages measure. That host number is a *rough* estimate, not a measurement: it can
+be several times the truth (Forge saw ~1.18M for a session whose request the
+provider counted at 69k), and chopping or handing off cannot relieve pressure the
+messages do not contain, so a figure over 3x what the messages plus fixed overhead
+measure is discounted. Earlier versions estimated locally and under-counted
+structured tool-result blocks badly enough that the soft threshold never tripped
+(a real 812k-token session estimated under 600k), so sessions silently took the
+lossy truncation instead of handing off: don't make a local estimate the primary
+source either. The engine also implements the host's
+`should_defer_preflight_to_real_usage` and never lets a rough estimate be written
+into `last_prompt_tokens` (the gateway persists that as the session's "actual" size).
+A truncation that would keep ≥90% of the transcript is skipped
+(`truncation_skipped_no_relief`): it would only rotate the session id.
 
 Firing early is **not** free: every handoff trades the entire live context for a
 ~8k document and interrupts real work. Measured on clean foreground turns, an
