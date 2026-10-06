@@ -96,33 +96,39 @@ def _resolve_engine(agent: Any) -> Optional[Any]:
     return engine
 
 
-def _estimate_usage(engine: Any, conversation_history: List[Dict[str, Any]]) -> float:
-    """Fraction of the context window currently in use.
+def _estimate_usage(engine: Any, conversation_history: List[Dict[str, Any]]):
+    """``(fraction, tokens, basis)`` of the context window currently in use.
 
     Source of truth, in order:
 
-    1. ``last_preflight_tokens`` — the live request size the host passed to
-       ``should_compress()``. This is the figure Hermes itself acts on.
-    2. ``estimate_messages_tokens_rough`` — only until we've seen a preflight
-       number (e.g. the first turn after a restart). It under-counts structured
+    1. ``engine.current_pressure()`` - the provider's own prompt_tokens when we
+       have one since the last rotation, else the host's preflight figure
+       corroborated against what the messages measure. Each carries its basis;
+       only ``provider_reported`` is a measurement.
+    2. ``estimate_messages_tokens_rough`` - only until the engine has seen any
+       figure (e.g. the first turn after a restart). It under-counts structured
        tool-result blocks badly: a real 812k-token session estimated under 600k
        here, which is exactly why it is not the primary source.
-    3. ``last_prompt_tokens`` — last resort; lags a full turn behind.
+    3. ``last_prompt_tokens`` - last resort; lags a full turn behind.
     """
     ctx_len = getattr(engine, "context_length", 0) or 0
     if not ctx_len:
-        return 0.0
+        return 0.0, 0, None
 
-    tokens = getattr(engine, "last_preflight_tokens", 0) or 0
+    tokens, basis = 0, None
+    pressure = getattr(engine, "current_pressure", lambda: None)()
+    if pressure:
+        tokens, basis = pressure
     if not tokens and estimate_messages_tokens_rough and conversation_history:
         try:
-            tokens = estimate_messages_tokens_rough(conversation_history)
+            tokens, basis = estimate_messages_tokens_rough(conversation_history), "engine_estimate"
         except Exception:
             tokens = 0
     if not tokens:
-        tokens = getattr(engine, "last_prompt_tokens", 0) or 0
+        tokens = max(0, getattr(engine, "last_prompt_tokens", 0) or 0)
+        basis = "host_estimate" if tokens else None
 
-    return tokens / ctx_len if ctx_len else 0.0
+    return tokens / ctx_len, tokens, basis
 
 
 # -- DETECTION -------------------------------------------------------------
@@ -152,33 +158,31 @@ def system_prompt_handler(
         # Keep usage fresh so the injected instruction's urgency tracks reality
         # as the session keeps growing while the agent hasn't handed off yet.
         if phase == PHASE_AUTHORING:
-            # Refresh ONLY from the host's live preflight figure. This engine
-            # copy is often brand new (the gateway builds an agent per message)
-            # with no preflight yet; falling back to the rough message estimate
-            # here overwrote the request-time figure with a number several times
-            # too low (Forge was told ~6% and ~62% while the log said 85%/86%).
-            preflight = getattr(engine, "last_preflight_tokens", 0) or 0
+            # Refresh ONLY from a figure the engine itself has (provider usage,
+            # or the corroborated host figure). This engine copy is often brand
+            # new (the gateway builds an agent per message) with nothing yet;
+            # falling back to the rough message estimate here overwrote the
+            # request-time figure with a number several times too low (Forge
+            # was told ~6% and ~62% while the log said 85%/86%).
+            pressure = getattr(engine, "current_pressure", lambda: None)()
             ctx_len = getattr(engine, "context_length", 0) or 0
-            if preflight and ctx_len:
+            if pressure and ctx_len:
+                preflight, pbasis = pressure
                 live = preflight / ctx_len
                 store.set_usage(session_id, live, tokens=preflight,
-                                context_length=ctx_len, basis="measured",
+                                context_length=ctx_len, basis=pbasis,
                                 soft=engine.soft_ratio, hard=engine.hard_ratio)
                 store.set_urgent(session_id,
                                  live >= getattr(engine, "urgent_ratio", URGENT_USAGE))
             return {"content": _marker()}
         return None
 
-    usage = _estimate_usage(engine, conversation_history)
+    usage, tokens, basis = _estimate_usage(engine, conversation_history)
     if usage >= engine.soft_ratio:
         # One entry point for every trigger so each request is logged and
         # ledgered identically (engine.request_handoff).
-        preflight = getattr(engine, "last_preflight_tokens", 0) or 0
-        ctx_len = getattr(engine, "context_length", 0) or 0
-        engine.request_handoff(usage, "turn_start",
-                               preflight or int(usage * ctx_len),
-                               session_id=session_id,
-                               basis="measured" if preflight else "estimated")
+        engine.request_handoff(usage, "turn_start", tokens,
+                               session_id=session_id, basis=basis)
         return {"content": _marker()}
 
     return None
@@ -236,8 +240,9 @@ def _usage_phrase(usage: float, detail: Optional[Dict[str, Any]] = None) -> str:
 
     "~62% of its context window" left an agent unable to tell whether that was
     tokens, a message count, or a fraction of some threshold. Name the token
-    figure, the window it is measured against, and whether it is a measurement
-    or an estimate.
+    figure, the window it is measured against, and whether it is the provider's
+    own count or an estimate - and when the host's raw estimate was discounted,
+    show both, so the agent never meets two "measured" numbers for one session.
     """
     pct = int(round(usage * 100))
     d = detail or {}
@@ -247,12 +252,19 @@ def _usage_phrase(usage: float, detail: Optional[Dict[str, Any]] = None) -> str:
         return f"at ~{pct}% of the model's context window"
     pct = int(round(tokens / ctx * 100))
     window = f"{pct}% of the model's {ctx:,}-token context window"
-    if d.get("basis") == "measured":
-        return (f"{tokens:,} tokens (as measured by the host on its latest request) "
-                f"— {window}")
-    who = "the host's" if d.get("basis") == "host_estimate" else "a rough"
-    return (f"an estimated ~{tokens:,} tokens ({who} estimate; the true size may "
-            f"differ) — {window}")
+    reported = int(d.get("reported") or 0)
+    if d.get("basis") == "provider_reported":
+        phrase = (f"{tokens:,} tokens (the provider's own prompt-token count from "
+                  f"its latest response) — {window}")
+    else:
+        who = "the host's" if d.get("basis") == "host_estimate" else "an engine"
+        phrase = (f"an estimated ~{tokens:,} tokens ({who} estimate, not a "
+                  f"provider count; the true size may differ) — {window}")
+    if reported and reported >= tokens * 1.5:
+        phrase += (f". The host's raw pre-send estimate was ~{reported:,} tokens, "
+                   "but the messages do not measure up to that, so it was "
+                   "discounted")
+    return phrase
 
 
 def _thresholds_phrase(detail: Optional[Dict[str, Any]]) -> str:
