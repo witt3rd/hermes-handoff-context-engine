@@ -227,6 +227,7 @@ class HandoffContextEngine(ContextEngine):
         self._own_request_tokens = 0       # our size of the last request (select_context)
         self._own_at_real = 0              # ... when the last real reading arrived
         self._deferral_logged = False
+        self._uncorroborated_logged = False
 
         # The live request-size figure the soft-threshold nudge (hook.py) reads,
         # AFTER corroboration: provider-reported where we have it, otherwise the
@@ -487,6 +488,7 @@ class HandoffContextEngine(ContextEngine):
         self._own_request_tokens = 0
         self._own_at_real = 0
         self._deferral_logged = False
+        self._uncorroborated_logged = False
         # Same sentinel the host parks after its own compaction: "no real
         # usage yet". Never leave the pre-swap figure for the gateway to
         # persist as the session's "actual" size.
@@ -522,13 +524,35 @@ class HandoffContextEngine(ContextEngine):
         if not reported:
             return 0, None
         if own:
-            overhead = (max(0, self.last_real_prompt_tokens - self._own_at_real)
-                        if self.last_real_prompt_tokens and self._own_at_real
-                        else ASSUMED_OVERHEAD_TOKENS)
-            cap = ROUGH_TRUST_FACTOR * (own + overhead)
+            cap = ROUGH_TRUST_FACTOR * (own + self._overhead_tokens())
             if reported > cap:
                 return cap, BASIS_ENGINE_ESTIMATE
         return reported, BASIS_HOST_ESTIMATE
+
+    def _overhead_tokens(self) -> int:
+        """Fixed per-request overhead: the revealed one if a provider reading
+        paired with our own size exists, else the assumed one."""
+        if self.last_real_prompt_tokens and self._own_at_real:
+            return max(0, self.last_real_prompt_tokens - self._own_at_real)
+        return ASSUMED_OVERHEAD_TOKENS
+
+    def _corroborated(self, basis: Optional[str],
+                      messages: Optional[List[Dict[str, Any]]] = None) -> bool:
+        """Whether a ``_pressure`` figure rests on something we can check.
+
+        Provider readings are real; an ``engine_estimate`` was capped by the
+        messages' own size. A bare ``host_estimate`` is only believable when we
+        have measured the messages it claims to describe. On a fresh engine
+        copy (the gateway builds one per message; ``select_context`` has not
+        run) nothing is measured, so the host's figure - ~1.18M for ~10k real
+        tokens, Forge 2026-10-05 - is a number we cannot confirm and must not
+        base any threshold decision on.
+        """
+        if basis in (BASIS_PROVIDER, BASIS_ENGINE_ESTIMATE):
+            return True
+        if basis is None:
+            return False
+        return bool(_request_tokens(messages) if messages else self._own_request_tokens)
 
     def current_pressure(self):
         """Best current ``(tokens, basis)`` without a fresh host figure, or None."""
@@ -587,7 +611,13 @@ class HandoffContextEngine(ContextEngine):
         # latter is ever "measured" (see _pressure).
         self._host_consulted = True
         tokens, basis = self._pressure(prompt_tokens)
-        if prompt_tokens:
+        if not tokens:
+            # The last stored figure is a replay of whatever the host saw (the
+            # gateway persists it as "actual"); it is no more trustworthy than
+            # a fresh host estimate, so it gets the same corroboration.
+            tokens, basis = self._pressure(max(0, self.last_prompt_tokens))
+        corroborated = self._corroborated(basis)
+        if prompt_tokens and corroborated:
             self.last_preflight_tokens = tokens
             self.last_preflight_basis = basis
 
@@ -598,9 +628,25 @@ class HandoffContextEngine(ContextEngine):
         if phase == PHASE_READY:
             return True
 
-        if not tokens:
-            tokens, basis = self.last_prompt_tokens, BASIS_PROVIDER
-            tokens = max(0, tokens)
+        if tokens and not corroborated:
+            # No messages measured, no provider reading: the host's figure is
+            # unverifiable here (should_compress receives no messages), and
+            # compress() - which does - could only decline it, which an in-turn
+            # caller reads as "cannot compress further". Neither the hard net
+            # nor a handoff request may rest on it; the provider's own count
+            # after the first call, or the messages at turn start, will decide.
+            if not self._uncorroborated_logged:
+                self._uncorroborated_logged = True
+                logger.warning(
+                    "Handoff: ignoring uncorroborated host estimate ~%s for %s "
+                    "- no provider reading and the messages are not measured; "
+                    "not acting on it.", f"{tokens:,}", self.session_id,
+                )
+                self.record_event("uncorroborated_estimate_ignored",
+                                  reported_tokens=int(prompt_tokens or 0),
+                                  tokens=int(tokens), basis=basis)
+            return False
+
         if tokens and self.context_length and tokens >= self.context_length * self.hard_ratio:
             logger.warning(
                 "Handoff: hard threshold reached in phase '%s' without a ready "
@@ -652,7 +698,9 @@ class HandoffContextEngine(ContextEngine):
         a clean no-op ("no progress", no rewrite), and the turn that follows
         delivers the instruction via pre_llm_call. In-turn callers keep the
         truncation: they are context-overflow recovery, where a no-op ends the
-        turn with "cannot compress further". ``force`` (manual /compress) also
+        turn with "cannot compress further" - but only when the messages
+        themselves measure big enough to chop (``_safety_truncate`` gates; a
+        host figure is never enough on its own). ``force`` (manual /compress) also
         keeps it — the operator asked for room now.
         """
         if not self.store or not self.session_id:
@@ -668,10 +716,18 @@ class HandoffContextEngine(ContextEngine):
             logger.warning("Handoff: phase 'ready' but document unusable; truncating")
 
         reported = int(current_tokens or 0)
-        tokens, basis = self._pressure(reported, messages)
+        # Every figure - the caller's, our stored preflight, the replayed
+        # last_prompt_tokens - is corroborated against THESE messages. The
+        # stored preflight used to be trusted as-is here, which is how a
+        # phantom ~1.18M recorded on a fresh engine copy (nothing measured at
+        # the time) became the basis of an in-turn truncation (Forge, 18:10:54).
+        stored = reported or self.last_preflight_tokens or max(0, self.last_prompt_tokens)
+        tokens, basis = self._pressure(stored, messages)
         if not tokens:
-            tokens = self.last_preflight_tokens or max(0, self.last_prompt_tokens)
-            basis = self.last_preflight_basis or BASIS_HOST_ESTIMATE
+            # Nothing reported at all: the messages themselves are all we have.
+            own = _request_tokens(messages)
+            tokens = own + self._overhead_tokens() if own else 0
+            basis = BASIS_ENGINE_ESTIMATE if tokens else None
         caller = "in-turn" if self._host_consulted else ("manual" if force else "out-of-turn")
         if (caller == "out-of-turn" and phase != PHASE_READY and tokens
                 and self.context_length
@@ -699,7 +755,7 @@ class HandoffContextEngine(ContextEngine):
             return messages
 
         return self._safety_truncate(messages, tokens=tokens, caller=caller,
-                                     basis=basis, reported=reported)
+                                     basis=basis, reported=reported, force=force)
 
     def request_handoff(self, usage: float, source: str, tokens: int = 0,
                         session_id: Optional[str] = None,
@@ -880,8 +936,15 @@ class HandoffContextEngine(ContextEngine):
         caller: str = "in-turn",
         basis: Optional[str] = None,
         reported: int = 0,
+        force: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Last-resort head/tail keep so the window is never exceeded."""
+        """Last-resort head/tail keep so the window is never exceeded.
+
+        Every path into the lossy chop ends here, so the gates live here: the
+        chop must be justified by what the MESSAGES measure, never by a figure
+        alone (see the three ``skip`` reasons below). ``force`` is the
+        operator's manual /compress and is exempt from the size gates only.
+        """
         system_msgs = [m for m in messages if m.get("role") == "system"]
         non_system = [m for m in messages if m.get("role") != "system"]
         # Bound by size as well as count: the last N messages can themselves be
@@ -900,19 +963,40 @@ class HandoffContextEngine(ContextEngine):
         # the transcript alone and say so.
         total_tokens = sum(_message_tokens(m) for m in non_system)
         kept_tokens = sum(_message_tokens(m) for m in tail)
+        skip = None
         if total_tokens and kept_tokens >= total_tokens * NO_RELIEF_KEPT_FRACTION:
+            skip = "no_relief"
+        elif not force and total_tokens <= budget:
+            # Everything already fits the retained budget: only the message
+            # COUNT cap would chop. Dropping 3 of 19 messages (~14k tokens) on
+            # a phantom 1.18M figure was the 18:10:54 truncation - the size
+            # never said so.
+            skip = "within_budget"
+        elif (not force and basis == BASIS_ENGINE_ESTIMATE and self.context_length
+              and total_tokens + self._overhead_tokens()
+              < self.context_length * self.hard_ratio):
+            # The figure was discounted or derived from the messages, and the
+            # messages plus fixed overhead still do not reach the hard net:
+            # nothing chopping them can relieve.
+            skip = "messages_below_hard"
+        if skip:
             logger.warning(
-                "Handoff: NOT truncating %s - %d messages measure ~%s tokens "
-                "and the truncation would keep ~%s of them; the host's figure "
+                "Handoff: NOT truncating %s (%s) - %d messages measure ~%s tokens "
+                "and the truncation would keep ~%s of them; the figure "
                 "(~%s, %s) is not something chopping messages can relieve.",
-                self.session_id, len(messages), f"{total_tokens:,}",
+                self.session_id, skip, len(messages), f"{total_tokens:,}",
                 f"{kept_tokens:,}", f"{tokens:,}" if tokens else "unknown",
                 basis or "unknown",
             )
             self.record_event("truncation_skipped_no_relief", tokens=tokens,
-                              caller=caller, basis=basis,
+                              caller=caller, basis=basis, reason=skip,
                               reported_tokens=reported, own_tokens=total_tokens,
                               kept_tokens=kept_tokens, messages_in=len(messages))
+            if self.store.get_phase(self.session_id) == PHASE_READY:
+                # A 'ready' phase whose document is unusable would otherwise
+                # re-enter here on every call, forever.
+                self.store.set_phase(self.session_id, PHASE_NORMAL)
+                self.store.set_handoff_path(self.session_id, None)
             return messages
 
         # Say which failure this is. The old note always claimed a handoff
