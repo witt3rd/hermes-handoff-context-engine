@@ -131,6 +131,20 @@ class HandoffStore:
         with _LOCK:
             _entry(session_id)["swap_count"] += 1
 
+    def decrement_swap_count(self, session_id: str) -> None:
+        with _LOCK:
+            e = _entry(session_id)
+            e["swap_count"] = max(0, e["swap_count"] - 1)
+
+    def get_pending_swap(self, session_id: str) -> Optional[str]:
+        """Path of a handoff swapped in but not yet confirmed committed."""
+        with _LOCK:
+            return _entry(session_id).get("pending_swap")
+
+    def set_pending_swap(self, session_id: str, path: Optional[str]) -> None:
+        with _LOCK:
+            _entry(session_id)["pending_swap"] = path
+
     def get_last_handoff(self, session_id: str) -> Optional[str]:
         """The content of the handoff from the most recent swap.
 
