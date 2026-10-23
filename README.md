@@ -341,3 +341,12 @@ the boundary and start clean. Pick the model that matches how you work.
 ## License
 
 MIT
+
+## Paths that bypass this engine
+
+Two opt-in Hermes features compact without calling `compress()`, so no handoff
+is written for them: the Codex app-server runtime (the app-server owns and
+compacts the thread) and native OpenAI Responses compaction
+(`compression.codex_responses_compact_threshold`, gpt-5.6 / Astra routes; its
+threshold follows the engine's `threshold_tokens` minus a margin, so it fires
+first). Leave both off when you rely on agent-authored handoffs.
