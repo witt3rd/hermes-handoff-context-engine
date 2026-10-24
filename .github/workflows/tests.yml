@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit (stdlib only, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+
+  host-e2e:
+    name: e2e (hermes-agent main compression path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # hermes-agent's pyproject carries no runtime deps for <3.14 (its package
+      # manager installs them), so install what importing run_agent needs.
+      - name: Install hermes-agent
+        run: |
+          python -m pip install -e hermes-agent
+          python -m pip install openai python-dotenv "httpx[socks]" rich tenacity \
+            requests jinja2 ruamel.yaml fire pyyaml tomli-w truststore certifi \
+            pydantic psutil
+      - name: Run all tests against the real host
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes-agent
+        run: python -m unittest discover -s tests -v
+      - name: Fail if the e2e tests were skipped
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes-agent
+        run: |
+          python -m unittest discover -s tests -p "test_e2e*" -v 2>&1 | tee e2e.log
+          ! grep -q "skipped" e2e.log
