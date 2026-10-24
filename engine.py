@@ -190,6 +190,13 @@ def _request_tokens(messages: List[Dict[str, Any]]) -> int:
     return sum(_message_tokens(m) for m in messages if isinstance(m, dict))
 
 
+def _fold_content(prefix: str, content: Any) -> Any:
+    """Prepend ``prefix`` to a message's content, keeping list content a list."""
+    if isinstance(content, list):
+        return [{"type": "text", "text": prefix}] + list(content)
+    return f"{prefix}\n\n{content or ''}"
+
+
 def _drop_orphan_tool_results(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Drop leading tool results whose assistant tool_call was cut away."""
     i = 0
@@ -415,8 +422,12 @@ class HandoffContextEngine(ContextEngine):
         self.store = HandoffStore()
         self.store.ensure_session(session_id)
         old_id = kwargs.get("old_session_id")
-        if kwargs.get("boundary_reason") == "compression" and old_id:
-            self.store.inherit(old_id, session_id)
+        if kwargs.get("boundary_reason") == "compression":
+            # The host committed the compaction: the swap is final.
+            self.store.set_pending_swap(old_id or session_id, None)
+            self.store.set_pending_swap(session_id, None)
+            if old_id:
+                self.store.inherit(old_id, session_id)
         self.compression_count = self.store.get_swap_count(session_id)
         # A fresh engine copy per message: pick up the last provider reading for
         # this session so pressure is anchored on a measurement, not a guess.
@@ -717,6 +728,7 @@ class HandoffContextEngine(ContextEngine):
             logger.warning("Handoff: no store/session; returning messages unchanged")
             return messages
 
+        self._restore_uncommitted_swap(self.session_id)
         phase = self.store.get_phase(self.session_id)
         if phase == PHASE_READY:
             swapped = self._swap_in_handoff(messages)
@@ -767,6 +779,34 @@ class HandoffContextEngine(ContextEngine):
         return self._safety_truncate(messages, tokens=tokens, caller=caller,
                                      basis=basis, reported=reported, force=force)
 
+    def _restore_uncommitted_swap(self, sid: Optional[str]) -> bool:
+        """Re-arm a swap the host never committed.
+
+        A swap consumes the handoff when compress() returns, but the host can
+        still discard that result (anti-growth refusal, timeout with a late
+        worker, rollback). A commit is announced by on_session_start(
+        boundary_reason="compression"), which clears the pending record. If one
+        is still here when the engine is next asked, the session is unchanged:
+        put the authored document back so the next compress() swaps it instead
+        of asking the agent to write it again.
+        """
+        if not self.store or not sid:
+            return False
+        pending = self.store.get_pending_swap(sid)
+        if not pending or self.store.get_phase(sid) != PHASE_NORMAL:
+            return False
+        if not Path(pending).is_file():
+            self.store.set_pending_swap(sid, None)
+            return False
+        self.store.set_pending_swap(sid, None)
+        self.store.set_handoff_path(sid, pending)
+        self.store.set_phase(sid, PHASE_READY)
+        self.store.decrement_swap_count(sid)
+        self.compression_count = self.store.get_swap_count(sid)
+        self.record_event("swap_restored", reason="host_did_not_commit",
+                          handoff_path=pending)
+        return True
+
     def request_handoff(self, usage: float, source: str, tokens: int = 0,
                         session_id: Optional[str] = None,
                         basis: Optional[str] = None,
@@ -780,6 +820,7 @@ class HandoffContextEngine(ContextEngine):
         sid = session_id or self.session_id
         if not self.store or not sid:
             return False
+        self._restore_uncommitted_swap(sid)
         phase = self.store.get_phase(sid)
         if phase == PHASE_READY:
             return False
@@ -876,15 +917,24 @@ class HandoffContextEngine(ContextEngine):
         # message, fold the handoff seed into it rather than doubling up user
         # turns; otherwise prepend the seed as its own user message.
         if tail and tail[0].get("role") == "user":
+            # The folded message carries a REAL user turn, so it must NOT be
+            # flagged as a compaction summary: the host's user-turn guarantee
+            # reads a flagged row as scaffolding and re-appends the last user
+            # message at the END of the transcript (after the tail's tool
+            # results), replaying a stale request. The SWAP_MARKER in the
+            # content identifies the seed instead.
             first = dict(tail[0])
-            first["content"] = f"{handoff_user['content']}\n\n{first.get('content', '')}"
-            if COMPRESSED_SUMMARY_METADATA_KEY not in first:
-                first[COMPRESSED_SUMMARY_METADATA_KEY] = True
+            first["content"] = _fold_content(handoff_user["content"], first.get("content"))
             seed = system_msgs + [first] + tail[1:]
         else:
             seed = system_msgs + [handoff_user] + tail
 
         # Reset the machine: back to normal, forget the consumed document.
+        # The host may still refuse or roll back this result (growth guard,
+        # timeout, late worker), and only on_session_start(boundary_reason=
+        # "compression") proves a commit - so keep a pending record that
+        # _restore_uncommitted_swap() can re-arm.
+        self.store.set_pending_swap(self.session_id, str(path))
         self.store.set_phase(self.session_id, PHASE_NORMAL)
         self.store.set_handoff_path(self.session_id, None)
         self.store.mark_swapped(self.session_id)
