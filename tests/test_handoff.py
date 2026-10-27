@@ -924,6 +924,60 @@ class HostSwapInteractionTests(unittest.TestCase):
                      "_ineffective_compression_count"):
             self.assertFalse(hasattr(e, attr), attr)
 
+
+class NativeCompactionGuardTests(unittest.TestCase):
+    def setUp(self):
+        state_mod._STATE.clear()
+        self.home = Path(tempfile.mkdtemp(prefix="handoff-test-native-"))
+        self._orig = engine_mod._codex_native_configured
+
+    def tearDown(self):
+        engine_mod._codex_native_configured = self._orig
+
+    def _events(self):
+        path = self.home / "handoffs" / "events.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+    def _start(self, agent=None):
+        e = engine_mod.HandoffContextEngine()
+        e.on_session_start("native-sess", hermes_home=str(self.home), agent=agent)
+        e.update_model(model="gpt-5.6", context_length=CTX, agent=agent)
+        return e
+
+    def test_config_enabled_warns_and_records_once(self):
+        engine_mod._codex_native_configured = lambda: True
+        with self.assertLogs(engine_mod.logger, level="WARNING") as cm:
+            self._start()
+        self.assertTrue(any("BYPASSES" in m for m in cm.output))
+        rows = [r for r in self._events() if r["event"] == "native_compaction_bypass"]
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["agent_disabled"])
+
+    def test_agent_attribute_is_switched_off(self):
+        engine_mod._codex_native_configured = lambda: False
+        agent = types.SimpleNamespace(codex_responses_native_compaction=True)
+        with self.assertLogs(engine_mod.logger, level="WARNING"):
+            self._start(agent)
+        self.assertFalse(agent.codex_responses_native_compaction)
+        rows = [r for r in self._events() if r["event"] == "native_compaction_bypass"]
+        self.assertTrue(rows[0]["agent_disabled"])
+
+    def test_disabled_is_silent(self):
+        engine_mod._codex_native_configured = lambda: False
+        agent = types.SimpleNamespace(codex_responses_native_compaction=False)
+        self._start(agent)
+        self.assertEqual(self._events(), [])
+
+    def test_update_model_alone_disables_agent(self):
+        engine_mod._codex_native_configured = lambda: False
+        agent = types.SimpleNamespace(codex_responses_native_compaction=True)
+        e = engine_mod.HandoffContextEngine()
+        with self.assertLogs(engine_mod.logger, level="WARNING"):
+            e.update_model(model="gpt-5.6", context_length=CTX, agent=agent)
+        self.assertFalse(agent.codex_responses_native_compaction)
+
 if __name__ == "__main__":
     unittest.main()
 

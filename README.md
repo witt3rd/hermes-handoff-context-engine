@@ -268,6 +268,17 @@ safety net** — sessions run into the model's hard limit and fail. With a plugi
 engine, `enabled` no longer means "use the built-in compressor," it means "allow
 compaction at all."
 
+### Requires `compression.codex_responses_native: false`
+
+The handoff engine requires `compression.codex_responses_native: false` (the
+default). When it is `true` on an eligible model (gpt-5.6 / Astra), Hermes asks
+the provider to compact server-side about 8k tokens below this engine's hard
+threshold, so `compress()` never runs: no handoff and no safety net. At init the
+engine detects the setting, logs a warning, writes a
+`native_compaction_bypass` row to `events.jsonl`, and, if the agent object is
+reachable, sets `codex_responses_native_compaction = False` itself. Do not rely
+on that; set the config key to `false`.
+
 ### Choosing thresholds
 
 Both are measured against the best figure the engine has, in order: the provider's

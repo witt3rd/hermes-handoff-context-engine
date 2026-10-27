@@ -101,6 +101,17 @@ def _load_settings() -> Dict[str, Any]:
     return settings if isinstance(settings, dict) else {}
 
 
+def _codex_native_configured() -> bool:
+    """True when ``compression.codex_responses_native`` is on in config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return False
+    comp = cfg.get("compression") if isinstance(cfg, dict) else None
+    return isinstance(comp, dict) and comp.get("codex_responses_native") is True
+
+
 SWAP_MARKER = "[CONTEXT HANDOFF — FRESH SESSION SEEDED FROM AGENT-AUTHORED HANDOFF]"
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -235,6 +246,8 @@ class HandoffContextEngine(ContextEngine):
         self._own_at_real = 0              # ... when the last real reading arrived
         self._deferral_logged = False
         self._uncorroborated_logged = False
+        self._native_warned = False
+        self._native_recorded = False
 
         # The live request-size figure the soft-threshold nudge (hook.py) reads,
         # AFTER corroboration: provider-reported where we have it, otherwise the
@@ -404,6 +417,48 @@ class HandoffContextEngine(ContextEngine):
 
     # -- Lifecycle ---------------------------------------------------------
 
+    def guard_native_compaction(self, agent: Any = None) -> bool:
+        """Detect Hermes native server-side compaction, which bypasses us.
+
+        With ``compression.codex_responses_native: true`` on an eligible model
+        the provider compacts ~8k tokens below our hard threshold and
+        ``compress()`` never runs. Warn loudly (log + events.jsonl) and, when
+        the agent object is reachable, switch
+        ``codex_responses_native_compaction`` off so this engine owns
+        compaction. Returns True when the bypass was detected. Never raises.
+        """
+        try:
+            attr_on = bool(getattr(agent, "codex_responses_native_compaction", False)) \
+                if agent is not None else False
+            detected = attr_on or _codex_native_configured()
+            if not detected:
+                return False
+            disabled = False
+            if agent is not None and hasattr(agent, "codex_responses_native_compaction"):
+                try:
+                    agent.codex_responses_native_compaction = False
+                    disabled = True
+                except Exception:
+                    pass
+            if not self._native_warned:
+                self._native_warned = True
+                logger.warning(
+                    "Handoff: compression.codex_responses_native is enabled; native "
+                    "server-side compaction fires below the hard threshold and "
+                    "BYPASSES this engine (no handoff, no safety net). %s "
+                    "Set compression.codex_responses_native: false.",
+                    "Disabled it on the agent for this session." if disabled
+                    else "Could not reach the agent to disable it.")
+            if self.handoff_dir and not self._native_recorded:
+                self._native_recorded = True
+                self.record_event("native_compaction_bypass",
+                                  agent_disabled=disabled,
+                                  config_enabled=_codex_native_configured())
+            return True
+        except Exception as exc:  # never break init
+            logger.debug("Handoff: native compaction check failed: %s", exc)
+            return False
+
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self.session_id = session_id
 
@@ -435,6 +490,7 @@ class HandoffContextEngine(ContextEngine):
         if reading and reading[0] > 0:
             self.last_real_prompt_tokens, self._own_at_real = reading
             self.awaiting_real_usage = False
+        self.guard_native_compaction(kwargs.get("agent"))
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         self.session_id = None
@@ -456,7 +512,9 @@ class HandoffContextEngine(ContextEngine):
         api_key: str = "",
         provider: str = "",
         api_mode: str = "",
+        **kwargs: Any,
     ) -> None:
+        self.guard_native_compaction(kwargs.get("agent"))
         self.context_length = context_length or 200000
         self.threshold_tokens = int(self.context_length * self.hard_ratio)
 
