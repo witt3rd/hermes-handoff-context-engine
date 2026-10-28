@@ -145,6 +145,14 @@ def system_prompt_handler(
     engine = _resolve_engine(agent)
     if engine is None:
         return None
+    # Hermes calls on_session_start/update_model without `agent`, so the engine
+    # cannot disable native compaction there; this hook does get the agent.
+    guard = getattr(engine, "guard_native_compaction", None)
+    if guard is not None:
+        try:
+            guard(agent)
+        except Exception:
+            pass
     store = getattr(engine, "store", None)
     if store is None:
         return None

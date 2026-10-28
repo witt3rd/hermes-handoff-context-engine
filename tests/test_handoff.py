@@ -793,6 +793,201 @@ class SessionRotationTests(unittest.TestCase):
         self.assertIn("seconds_since_swap", req)
 
 
+
+try:  # the real host classifiers, when hermes-agent is importable
+    from agent.conversation_compression import (
+        _ensure_compressed_has_user_turn, _is_real_user_message,
+    )
+    from agent.context_compressor import SUMMARY_PREFIX
+    HOST = True
+except Exception:  # stub ABC or a host missing optional deps
+    HOST = False
+
+
+class HostSwapInteractionTests(unittest.TestCase):
+    """How host code around compress() treats the handoff seed."""
+
+    def setUp(self):
+        state_mod._STATE.clear()
+        self.home = Path(tempfile.mkdtemp(prefix="handoff-test-profile-"))
+        self.sid = f"sess-{self._testMethodName}"
+        self.doc = self.home / "h.md"
+        self.doc.write_text("## Objective\n- keep going\n")
+
+    def _ready_engine(self):
+        e = engine_mod.HandoffContextEngine()
+        e.on_session_start(self.sid, hermes_home=str(self.home))
+        e.update_model(model="m", context_length=CTX)
+        e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(self.doc)})
+        return e
+
+    def _tail_user_first_history(self):
+        """Last user turn is the first retained message and a tool call is in flight."""
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "do X"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "1", "content": "result"},
+        ]
+
+    # (1) user-turn guarantee: a folded real user turn must stay real
+    def test_folded_seed_is_not_flagged_as_summary(self):
+        e = self._ready_engine()
+        e.keep_tokens = 10_000
+        out = e.compress(self._tail_user_first_history(), current_tokens=1)
+        folded = [m for m in out if engine_mod.SWAP_MARKER in str(m.get("content"))]
+        self.assertEqual(len(folded), 1)
+        self.assertIn("do X", folded[0]["content"])
+        self.assertNotIn(engine_mod.COMPRESSED_SUMMARY_METADATA_KEY, folded[0])
+
+    @unittest.skipUnless(HOST, "needs hermes-agent importable")
+    def test_host_user_turn_guarantee_does_not_replay_request_after_tool_result(self):
+        import copy
+        e = self._ready_engine()
+        e.keep_tokens = 10_000
+        orig = self._tail_user_first_history()
+        out = e.compress(copy.deepcopy(orig), current_tokens=1)
+        self.assertTrue(_is_real_user_message(next(
+            m for m in out if engine_mod.SWAP_MARKER in str(m.get("content")))))
+        _ensure_compressed_has_user_turn(orig, out)
+        self.assertNotEqual(out[-1]["role"], "user",
+                            "host re-appended the last user message after the tool result")
+        self.assertEqual(sum("do X" in str(m.get("content")) for m in out), 1)
+
+    def test_folding_keeps_list_content_a_list(self):
+        folded = engine_mod._fold_content("PFX", [{"type": "text", "text": "hi"}])
+        self.assertEqual(folded[0]["text"], "PFX")
+        self.assertEqual(folded[1], {"type": "text", "text": "hi"})
+
+    # (2) the REFERENCE ONLY prefix must never be on the handoff
+    def test_seed_carries_no_reference_only_framing(self):
+        e = self._ready_engine()
+        out = e.compress(_history(), current_tokens=1)
+        text = "\n".join(str(m.get("content")) for m in out)
+        self.assertNotIn("REFERENCE ONLY", text)
+        self.assertNotIn("CONTEXT COMPACTION", text)
+        self.assertIn("Treat it as ground truth", text)
+
+    @unittest.skipUnless(HOST, "needs hermes-agent importable")
+    def test_host_does_not_add_the_summary_prefix_to_a_plugin_seed(self):
+        # The prefix is applied inside ContextCompressor only; a plugin's list is
+        # taken as returned. Pin that our seed does not start with it either.
+        e = self._ready_engine()
+        out = e.compress(_history(), current_tokens=1)
+        self.assertFalse(any(str(m.get("content")).startswith(SUMMARY_PREFIX[:40]) for m in out))
+
+    # (1) commit fence / growth refusal / timeout: swap consumed but never committed
+    def test_uncommitted_swap_is_rearmed_instead_of_asking_again(self):
+        e = self._ready_engine()
+        out = e.compress(_history(), current_tokens=1)
+        self.assertTrue(any(engine_mod.SWAP_MARKER in str(m.get("content")) for m in out))
+        store = state_mod.HandoffStore()
+        self.assertEqual(store.get_phase(self.sid), state_mod.PHASE_NORMAL)
+        # host refused (growth guard / timeout): the same engine is asked again
+        e.request_handoff(0.9, "turn_start", 900_000)
+        self.assertEqual(store.get_phase(self.sid), state_mod.PHASE_READY)
+        self.assertEqual(store.get_swap_count(self.sid), 0)
+        again = e.compress(_history(), current_tokens=1)
+        self.assertTrue(any(engine_mod.SWAP_MARKER in str(m.get("content")) for m in again))
+
+    def test_committed_swap_is_final(self):
+        e = self._ready_engine()
+        e.compress(_history(), current_tokens=1)
+        new_sid = self.sid + "-child"
+        e2 = engine_mod.HandoffContextEngine()
+        e2.on_session_start(new_sid, hermes_home=str(self.home),
+                            boundary_reason="compression", old_session_id=self.sid)
+        e.on_session_start(self.sid, hermes_home=str(self.home),
+                           boundary_reason="compression", old_session_id=self.sid)
+        store = state_mod.HandoffStore()
+        self.assertIsNone(store.get_pending_swap(self.sid))
+        e.request_handoff(0.9, "turn_start", 900_000)
+        self.assertEqual(store.get_phase(self.sid), state_mod.PHASE_AUTHORING)
+
+    # (3) clone_for_agent: deepcopy of the in-process state
+    def test_deepcopy_clone_is_independent_but_shares_the_store(self):
+        import copy
+        e = self._ready_engine()
+        clone = copy.deepcopy(e)
+        clone.update_model(model="m2", context_length=1234)
+        self.assertEqual(e.context_length, CTX)
+        self.assertEqual(clone.session_id, self.sid)
+        # the store is module-global by design: both see the ready handoff
+        self.assertEqual(clone.store.get_phase(self.sid), state_mod.PHASE_READY)
+
+    # (4) host breaker/cooldown: the engine must stay outside both
+    def test_engine_opts_out_of_host_breaker_and_cooldown(self):
+        e = engine_mod.HandoffContextEngine()
+        for attr in ("_automatic_compression_blocked", "_compression_block_reason",
+                     "record_rejected_compaction", "_summary_failure_cooldown_until",
+                     "_ineffective_compression_count"):
+            self.assertFalse(hasattr(e, attr), attr)
+
+
+class NativeCompactionGuardTests(unittest.TestCase):
+    def setUp(self):
+        state_mod._STATE.clear()
+        self.home = Path(tempfile.mkdtemp(prefix="handoff-test-native-"))
+        self._orig = engine_mod._codex_native_configured
+
+    def tearDown(self):
+        engine_mod._codex_native_configured = self._orig
+
+    def _events(self):
+        path = self.home / "handoffs" / "events.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+    def _start(self, agent=None):
+        e = engine_mod.HandoffContextEngine()
+        e.on_session_start("native-sess", hermes_home=str(self.home), agent=agent)
+        e.update_model(model="gpt-5.6", context_length=CTX, agent=agent)
+        return e
+
+    def test_hook_disables_native_when_hermes_passes_no_agent(self):
+        # Hermes calls on_session_start/update_model without `agent`; the
+        # pre-LLM hook receives it and must switch native compaction off.
+        agent = types.SimpleNamespace(codex_responses_native_compaction=True)
+        e = self._start()
+        agent.context_compressor = e
+        self.assertTrue(agent.codex_responses_native_compaction)
+        hook_mod.system_prompt_handler(agent, "native-sess", [])
+        self.assertFalse(agent.codex_responses_native_compaction)
+
+    def test_config_enabled_warns_and_records_once(self):
+        engine_mod._codex_native_configured = lambda: True
+        with self.assertLogs(engine_mod.logger, level="WARNING") as cm:
+            self._start()
+        self.assertTrue(any("BYPASSES" in m for m in cm.output))
+        rows = [r for r in self._events() if r["event"] == "native_compaction_bypass"]
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["agent_disabled"])
+
+    def test_agent_attribute_is_switched_off(self):
+        engine_mod._codex_native_configured = lambda: False
+        agent = types.SimpleNamespace(codex_responses_native_compaction=True)
+        with self.assertLogs(engine_mod.logger, level="WARNING"):
+            self._start(agent)
+        self.assertFalse(agent.codex_responses_native_compaction)
+        rows = [r for r in self._events() if r["event"] == "native_compaction_bypass"]
+        self.assertTrue(rows[0]["agent_disabled"])
+
+    def test_disabled_is_silent(self):
+        engine_mod._codex_native_configured = lambda: False
+        agent = types.SimpleNamespace(codex_responses_native_compaction=False)
+        self._start(agent)
+        self.assertEqual(self._events(), [])
+
+    def test_update_model_alone_disables_agent(self):
+        engine_mod._codex_native_configured = lambda: False
+        agent = types.SimpleNamespace(codex_responses_native_compaction=True)
+        e = engine_mod.HandoffContextEngine()
+        with self.assertLogs(engine_mod.logger, level="WARNING"):
+            e.update_model(model="gpt-5.6", context_length=CTX, agent=agent)
+        self.assertFalse(agent.codex_responses_native_compaction)
+
 if __name__ == "__main__":
     unittest.main()
 

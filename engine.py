@@ -101,6 +101,17 @@ def _load_settings() -> Dict[str, Any]:
     return settings if isinstance(settings, dict) else {}
 
 
+def _codex_native_configured() -> bool:
+    """True when ``compression.codex_responses_native`` is on in config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return False
+    comp = cfg.get("compression") if isinstance(cfg, dict) else None
+    return isinstance(comp, dict) and comp.get("codex_responses_native") is True
+
+
 SWAP_MARKER = "[CONTEXT HANDOFF — FRESH SESSION SEEDED FROM AGENT-AUTHORED HANDOFF]"
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -190,6 +201,13 @@ def _request_tokens(messages: List[Dict[str, Any]]) -> int:
     return sum(_message_tokens(m) for m in messages if isinstance(m, dict))
 
 
+def _fold_content(prefix: str, content: Any) -> Any:
+    """Prepend ``prefix`` to a message's content, keeping list content a list."""
+    if isinstance(content, list):
+        return [{"type": "text", "text": prefix}] + list(content)
+    return f"{prefix}\n\n{content or ''}"
+
+
 def _drop_orphan_tool_results(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Drop leading tool results whose assistant tool_call was cut away."""
     i = 0
@@ -228,6 +246,8 @@ class HandoffContextEngine(ContextEngine):
         self._own_at_real = 0              # ... when the last real reading arrived
         self._deferral_logged = False
         self._uncorroborated_logged = False
+        self._native_warned = False
+        self._native_recorded = False
 
         # The live request-size figure the soft-threshold nudge (hook.py) reads,
         # AFTER corroboration: provider-reported where we have it, otherwise the
@@ -397,6 +417,48 @@ class HandoffContextEngine(ContextEngine):
 
     # -- Lifecycle ---------------------------------------------------------
 
+    def guard_native_compaction(self, agent: Any = None) -> bool:
+        """Detect Hermes native server-side compaction, which bypasses us.
+
+        With ``compression.codex_responses_native: true`` on an eligible model
+        the provider compacts ~8k tokens below our hard threshold and
+        ``compress()`` never runs. Warn loudly (log + events.jsonl) and, when
+        the agent object is reachable, switch
+        ``codex_responses_native_compaction`` off so this engine owns
+        compaction. Returns True when the bypass was detected. Never raises.
+        """
+        try:
+            attr_on = bool(getattr(agent, "codex_responses_native_compaction", False)) \
+                if agent is not None else False
+            detected = attr_on or _codex_native_configured()
+            if not detected:
+                return False
+            disabled = False
+            if agent is not None and hasattr(agent, "codex_responses_native_compaction"):
+                try:
+                    agent.codex_responses_native_compaction = False
+                    disabled = True
+                except Exception:
+                    pass
+            if not self._native_warned:
+                self._native_warned = True
+                logger.warning(
+                    "Handoff: compression.codex_responses_native is enabled; native "
+                    "server-side compaction fires below the hard threshold and "
+                    "BYPASSES this engine (no handoff, no safety net). %s "
+                    "Set compression.codex_responses_native: false.",
+                    "Disabled it on the agent for this session." if disabled
+                    else "Could not reach the agent to disable it.")
+            if self.handoff_dir and not self._native_recorded:
+                self._native_recorded = True
+                self.record_event("native_compaction_bypass",
+                                  agent_disabled=disabled,
+                                  config_enabled=_codex_native_configured())
+            return True
+        except Exception as exc:  # never break init
+            logger.debug("Handoff: native compaction check failed: %s", exc)
+            return False
+
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self.session_id = session_id
 
@@ -415,8 +477,12 @@ class HandoffContextEngine(ContextEngine):
         self.store = HandoffStore()
         self.store.ensure_session(session_id)
         old_id = kwargs.get("old_session_id")
-        if kwargs.get("boundary_reason") == "compression" and old_id:
-            self.store.inherit(old_id, session_id)
+        if kwargs.get("boundary_reason") == "compression":
+            # The host committed the compaction: the swap is final.
+            self.store.set_pending_swap(old_id or session_id, None)
+            self.store.set_pending_swap(session_id, None)
+            if old_id:
+                self.store.inherit(old_id, session_id)
         self.compression_count = self.store.get_swap_count(session_id)
         # A fresh engine copy per message: pick up the last provider reading for
         # this session so pressure is anchored on a measurement, not a guess.
@@ -424,6 +490,7 @@ class HandoffContextEngine(ContextEngine):
         if reading and reading[0] > 0:
             self.last_real_prompt_tokens, self._own_at_real = reading
             self.awaiting_real_usage = False
+        self.guard_native_compaction(kwargs.get("agent"))
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         self.session_id = None
@@ -445,7 +512,9 @@ class HandoffContextEngine(ContextEngine):
         api_key: str = "",
         provider: str = "",
         api_mode: str = "",
+        **kwargs: Any,
     ) -> None:
+        self.guard_native_compaction(kwargs.get("agent"))
         self.context_length = context_length or 200000
         self.threshold_tokens = int(self.context_length * self.hard_ratio)
 
@@ -717,6 +786,7 @@ class HandoffContextEngine(ContextEngine):
             logger.warning("Handoff: no store/session; returning messages unchanged")
             return messages
 
+        self._restore_uncommitted_swap(self.session_id)
         phase = self.store.get_phase(self.session_id)
         if phase == PHASE_READY:
             swapped = self._swap_in_handoff(messages)
@@ -767,6 +837,34 @@ class HandoffContextEngine(ContextEngine):
         return self._safety_truncate(messages, tokens=tokens, caller=caller,
                                      basis=basis, reported=reported, force=force)
 
+    def _restore_uncommitted_swap(self, sid: Optional[str]) -> bool:
+        """Re-arm a swap the host never committed.
+
+        A swap consumes the handoff when compress() returns, but the host can
+        still discard that result (anti-growth refusal, timeout with a late
+        worker, rollback). A commit is announced by on_session_start(
+        boundary_reason="compression"), which clears the pending record. If one
+        is still here when the engine is next asked, the session is unchanged:
+        put the authored document back so the next compress() swaps it instead
+        of asking the agent to write it again.
+        """
+        if not self.store or not sid:
+            return False
+        pending = self.store.get_pending_swap(sid)
+        if not pending or self.store.get_phase(sid) != PHASE_NORMAL:
+            return False
+        if not Path(pending).is_file():
+            self.store.set_pending_swap(sid, None)
+            return False
+        self.store.set_pending_swap(sid, None)
+        self.store.set_handoff_path(sid, pending)
+        self.store.set_phase(sid, PHASE_READY)
+        self.store.decrement_swap_count(sid)
+        self.compression_count = self.store.get_swap_count(sid)
+        self.record_event("swap_restored", reason="host_did_not_commit",
+                          handoff_path=pending)
+        return True
+
     def request_handoff(self, usage: float, source: str, tokens: int = 0,
                         session_id: Optional[str] = None,
                         basis: Optional[str] = None,
@@ -780,6 +878,7 @@ class HandoffContextEngine(ContextEngine):
         sid = session_id or self.session_id
         if not self.store or not sid:
             return False
+        self._restore_uncommitted_swap(sid)
         phase = self.store.get_phase(sid)
         if phase == PHASE_READY:
             return False
@@ -876,15 +975,24 @@ class HandoffContextEngine(ContextEngine):
         # message, fold the handoff seed into it rather than doubling up user
         # turns; otherwise prepend the seed as its own user message.
         if tail and tail[0].get("role") == "user":
+            # The folded message carries a REAL user turn, so it must NOT be
+            # flagged as a compaction summary: the host's user-turn guarantee
+            # reads a flagged row as scaffolding and re-appends the last user
+            # message at the END of the transcript (after the tail's tool
+            # results), replaying a stale request. The SWAP_MARKER in the
+            # content identifies the seed instead.
             first = dict(tail[0])
-            first["content"] = f"{handoff_user['content']}\n\n{first.get('content', '')}"
-            if COMPRESSED_SUMMARY_METADATA_KEY not in first:
-                first[COMPRESSED_SUMMARY_METADATA_KEY] = True
+            first["content"] = _fold_content(handoff_user["content"], first.get("content"))
             seed = system_msgs + [first] + tail[1:]
         else:
             seed = system_msgs + [handoff_user] + tail
 
         # Reset the machine: back to normal, forget the consumed document.
+        # The host may still refuse or roll back this result (growth guard,
+        # timeout, late worker), and only on_session_start(boundary_reason=
+        # "compression") proves a commit - so keep a pending record that
+        # _restore_uncommitted_swap() can re-arm.
+        self.store.set_pending_swap(self.session_id, str(path))
         self.store.set_phase(self.session_id, PHASE_NORMAL)
         self.store.set_handoff_path(self.session_id, None)
         self.store.mark_swapped(self.session_id)

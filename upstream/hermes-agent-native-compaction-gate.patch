@@ -1,0 +1,24 @@
+Ready-to-file patch for NousResearch/hermes-agent (not applied here; verify
+line context against current main before filing).
+
+Problem: native_compaction_context_management never checks which context
+engine is installed, so server-side compaction fires ~8k tokens below an
+external engine's threshold and the engine's compress() never runs.
+
+--- a/agent/native_compaction.py
++++ b/agent/native_compaction.py
+@@ def native_compaction_context_management(agent, ...):
+     # (after the compression_enabled check)
++    from agent.context_compressor import ContextCompressor
++    if not isinstance(getattr(agent, "context_compressor", None), ContextCompressor):
++        return None  # external engines own compaction policy
+
+--- a/tests/agent/test_native_compaction.py
++++ b/tests/agent/test_native_compaction.py
++def test_external_context_engine_disables_native_compaction():
++    # reuse this file's existing helper that builds an eligible gpt-5.6 agent
++    agent = _eligible_agent()          # native compaction on, compression enabled
++    class StubEngine(ContextEngine):   # not a ContextCompressor
++        ...
++    agent.context_compressor = StubEngine()
++    assert native_compaction_context_management(agent, ...) is None
