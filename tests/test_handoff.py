@@ -946,6 +946,16 @@ class NativeCompactionGuardTests(unittest.TestCase):
         e.update_model(model="gpt-5.6", context_length=CTX, agent=agent)
         return e
 
+    def test_hook_disables_native_when_hermes_passes_no_agent(self):
+        # Hermes calls on_session_start/update_model without `agent`; the
+        # pre-LLM hook receives it and must switch native compaction off.
+        agent = types.SimpleNamespace(codex_responses_native_compaction=True)
+        e = self._start()
+        agent.context_compressor = e
+        self.assertTrue(agent.codex_responses_native_compaction)
+        hook_mod.system_prompt_handler(agent, "native-sess", [])
+        self.assertFalse(agent.codex_responses_native_compaction)
+
     def test_config_enabled_warns_and_records_once(self):
         engine_mod._codex_native_configured = lambda: True
         with self.assertLogs(engine_mod.logger, level="WARNING") as cm:
